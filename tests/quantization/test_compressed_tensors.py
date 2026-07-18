@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_compressed_tensors.py`.
 """
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -932,6 +933,54 @@ def test_wna16_marlin_moe_w2_scale_sharding(actorder, group_size, part, full, ex
         actorder, group_size, part, full
     )
     assert result == expected
+
+
+def test_wna16_marlin_moe_receives_routed_layer_name(monkeypatch):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe as moe_module,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe_wna16_marlin as marlin_module,
+    )
+
+    weight_quant = SimpleNamespace(
+        group_size=128,
+        num_bits=4,
+        strategy=QuantizationStrategy.GROUP,
+        actorder="static",
+    )
+    scheme = {
+        "weights": weight_quant,
+        "input_activations": None,
+        "format": "pack-quantized",
+    }
+    quant_config = SimpleNamespace(
+        _add_fused_moe_to_target_scheme_map=lambda: None,
+        get_scheme_dict=lambda layer, name: scheme,
+        _is_mxfp4=lambda weight: False,
+        _is_mxfp8=lambda weight: False,
+        _is_wNa16_group_channel=lambda weight, inputs: True,
+    )
+    layer = SimpleNamespace(moe_config=object())
+    captured = {}
+
+    def make_method(weight, inputs, moe, layer_name):
+        captured["layer_name"] = layer_name
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        moe_module, "check_moe_marlin_supports_layer", lambda *a, **k: True
+    )
+    monkeypatch.setattr(moe_module.current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(
+        marlin_module, "CompressedTensorsWNA16MarlinMoEMethod", make_method
+    )
+
+    moe_module.CompressedTensorsMoEMethod.get_moe_method(
+        quant_config, layer, "model.layers.3.mlp.experts"
+    )
+
+    assert captured["layer_name"] == "model.layers.3.mlp.experts"
 
 
 @pytest.mark.skipif(

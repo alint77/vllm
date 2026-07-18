@@ -9,7 +9,13 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import Field
 
-from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config import (
+    AttentionConfig,
+    CompilationConfig,
+    ModelConfig,
+    TieredMoEConfig,
+    config,
+)
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -212,6 +218,54 @@ def test_jit_monitor_verbose_arg():
 
     assert args.jit_monitor_verbose
     assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
+
+
+def test_tiered_moe_cli_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--enable-tiered-moe",
+            "--tiered-moe-backend",
+            "uva",
+            "--tiered-moe-hbm-reserve-gb",
+            "6",
+            "--tiered-moe-host-reserve-gb",
+            "9",
+            "--tiered-moe-plan-only",
+            "--grace-machine-profile",
+            "/tmp/gh200.json",
+            "--mla-cache-tier",
+            "host_uva",
+        ]
+    )
+
+    assert args.enable_tiered_moe
+    assert args.tiered_moe_backend == "uva"
+    assert args.tiered_moe_hbm_reserve_gb == 6
+    assert args.tiered_moe_host_reserve_gb == 9
+    assert args.tiered_moe_plan_only
+    assert args.grace_machine_profile == "/tmp/gh200.json"
+    assert args.mla_cache_tier == "host_uva"
+
+
+def test_tiered_moe_config_enforces_reserves_and_enablement():
+    with pytest.raises(ValueError, match="requires enable_tiered_moe"):
+        TieredMoEConfig(plan_only=True)
+    with pytest.raises(ValueError, match="requires grace_machine_profile"):
+        TieredMoEConfig(enabled=True, plan_only=True)
+    with pytest.raises(ValueError, match="at least 7 GB HBM"):
+        TieredMoEConfig(enabled=True, hbm_reserve_gb=6.99)
+    with pytest.raises(ValueError, match="at least 8 GB host"):
+        TieredMoEConfig(enabled=True, host_reserve_gb=7.99)
+
+    config = TieredMoEConfig(
+        enabled=True,
+        backend="uva",
+        mla_cache_tier="host_uva",
+        grace_machine_profile="/tmp/gh200.json",
+    )
+    assert config.hbm_reserve_gb == 7
+    assert config.host_reserve_gb == 8
 
 
 @pytest.mark.parametrize("mode", ["warn", "error"])

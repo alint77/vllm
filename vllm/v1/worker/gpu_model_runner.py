@@ -490,6 +490,7 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        self.dsa_index_trace_initialized = False
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -4184,6 +4185,12 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if self.dsa_index_trace_initialized:
+                self.dsa_index_trace_capturer.prepare_step(
+                    req_ids,
+                    num_scheduled_tokens_np,
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4386,6 +4393,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if self.dsa_index_trace_initialized:
+            self.dsa_index_trace_capturer.drain()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -7183,8 +7193,32 @@ class GPUModelRunner(
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         packed_backing: torch.Tensor | None = None
+        grace_allocations = []
+        min_local_fraction = 1.0
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_cache_tensor.block_stride > 0:
+            if kv_cache_tensor.memory_tier == "host_uva":
+                if kv_cache_tensor.block_stride > 0:
+                    raise ValueError("Packed host-UVA KV tensors are not supported")
+                from vllm.model_executor.offloader.grace import GraceAllocation
+                from vllm.utils.numa_utils import _get_numa_node
+
+                device_index = torch.accelerator.current_device_index()
+                numa_node = _get_numa_node(self.parallel_config, device_index)
+                allocation = GraceAllocation.allocate_pinned(
+                    (kv_cache_tensor.size,),
+                    torch.int8,
+                    device_index,
+                    numa_node,
+                )
+                allocation.cpu_tensor.zero_()
+                placement = allocation.audit_numa(
+                    samples=4,
+                    strict=self.vllm_config.tiered_moe_config.numa_strict,
+                )
+                min_local_fraction = min(min_local_fraction, placement.local_fraction)
+                grace_allocations.append(allocation)
+                tensor = allocation.cuda_alias
+            elif kv_cache_tensor.block_stride > 0:
                 # Allocate once; all packed tensors alias the same backing.
                 if packed_backing is None:
                     packed_backing = torch.zeros(
@@ -7199,6 +7233,17 @@ class GPUModelRunner(
                 )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
+
+        if grace_allocations:
+            self.tiered_kv_grace_allocations = grace_allocations
+            logger.info(
+                "Allocated %.2f GiB host-UVA KV cache across %d tensors "
+                "(minimum sampled NUMA locality %.1f%%)",
+                sum(allocation.num_bytes for allocation in grace_allocations)
+                / (1024**3),
+                len(grace_allocations),
+                min_local_fraction * 100,
+            )
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -7606,6 +7651,56 @@ class GPUModelRunner(
             device=self.device,
         )
         self.routed_experts_initialized = True
+
+    def init_dsa_index_trace_capturer(self) -> None:
+        output_dir = envs.VLLM_DSA_INDEX_TRACE_DIR
+        if not output_dir:
+            return
+
+        from vllm.model_executor.layers.dsa_index_trace import (
+            DSAIndexTraceCapturer,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        indexers = [
+            module
+            for module in self.model.modules()
+            if callable(getattr(module, "set_index_trace_capture_fn", None))
+        ]
+        if not indexers:
+            raise ValueError("DSA index tracing requires full indexer layers")
+        layer_ids = tuple(
+            sorted(extract_layer_index(module.prefix) for module in indexers)
+        )
+        topks = {module.topk_tokens for module in indexers}
+        if len(topks) != 1:
+            raise ValueError("DSA index tracing requires a uniform index top-k")
+        interval = envs.VLLM_DSA_INDEX_TRACE_INTERVAL
+        capturer = DSAIndexTraceCapturer(
+            output_dir=output_dir,
+            layer_ids=layer_ids,
+            topk=topks.pop(),
+            max_num_reqs=self.max_num_reqs,
+            interval=interval,
+            device=self.device,
+            writer=is_global_first_rank(),
+        )
+        for module in indexers:
+            layer_id = extract_layer_index(module.prefix)
+
+            def _capture_fn(topk_indices, _layer_id=layer_id, _capturer=capturer):
+                _capturer.capture(_layer_id, topk_indices)
+
+            module.set_index_trace_capture_fn(_capture_fn)
+        self.dsa_index_trace_capturer = capturer
+        self.dsa_index_trace_initialized = True
+        logger.info(
+            "Initialized DSA index trace capture: dir=%s layers=%d topk=%d interval=%d",
+            output_dir,
+            len(layer_ids),
+            capturer.device_buffer.shape[-1],
+            interval,
+        )
 
     def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
         from vllm.model_executor.layers.fused_moe.layer import MoERunner

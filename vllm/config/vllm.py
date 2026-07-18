@@ -48,6 +48,7 @@ from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
 from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
+from .tiered_moe import TieredMoEConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
 
@@ -310,6 +311,8 @@ class VllmConfig:
     """Load configuration."""
     offload_config: OffloadConfig = Field(default_factory=OffloadConfig)
     """Model weight offloading configuration."""
+    tiered_moe_config: TieredMoEConfig = Field(default_factory=TieredMoEConfig)
+    """Static HBM/host-UVA MoE placement configuration."""
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
@@ -436,6 +439,7 @@ class VllmConfig:
             vllm_factors.append(self.offload_config.compute_hash())
         else:
             vllm_factors.append("None")
+        vllm_factors.append(self.tiered_moe_config.compute_hash())
         if self.attention_config:
             vllm_factors.append(self.attention_config.compute_hash())
         else:
@@ -2248,6 +2252,56 @@ class VllmConfig:
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
             )
+
+    @model_validator(mode="after")
+    def validate_tiered_moe(self) -> "VllmConfig":
+        """Reject configurations outside the initial tiered-MoE contract."""
+        if not self.tiered_moe_config.enabled:
+            return self
+        if self.model_config is None:
+            raise ValueError("Tiered MoE requires a model configuration")
+        if self.model_config.architectures != ["GlmMoeDsaForCausalLM"]:
+            raise ValueError("Tiered MoE requires the pinned GLM architecture")
+        model_type = getattr(self.model_config.hf_text_config, "model_type", None)
+        if model_type != "glm_moe_dsa":
+            raise ValueError("Tiered MoE requires the glm_moe_dsa model type")
+        if self.device_config.device_type != "cuda":
+            raise ValueError("Tiered MoE requires CUDA")
+        parallel = self.parallel_config
+        if (
+            parallel.tensor_parallel_size != 4
+            or parallel.data_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+        ):
+            raise ValueError("Tiered MoE initially requires TP4, DP1, PP1, PCP1, DCP1")
+        if not parallel.enable_expert_parallel:
+            raise ValueError("Tiered MoE requires expert parallelism")
+        if not parallel.enable_ep_weight_filter:
+            raise ValueError("Tiered MoE requires EP weight filtering")
+        if parallel.enable_eplb:
+            raise ValueError("Tiered MoE does not support EPLB")
+        if not parallel.numa_bind:
+            raise ValueError("Tiered MoE requires NUMA binding")
+        if self.scheduler_config.max_num_seqs != 1:
+            raise ValueError("Tiered MoE initially requires max_num_seqs=1")
+        if self.scheduler_config.max_num_batched_tokens != 8192:
+            raise ValueError(
+                "Tiered MoE initially requires max_num_batched_tokens=8192"
+            )
+        if self.model_config.max_model_len != 400_000:
+            raise ValueError("Tiered MoE initially requires max_model_len=400000")
+        if self.cache_config.cache_dtype != "fp8_ds_mla":
+            raise ValueError("Tiered MoE requires kv_cache_dtype=fp8_ds_mla")
+        if self.cache_config.block_size != 64:
+            raise ValueError("Tiered MoE initially requires block_size=64")
+        if (
+            self.offload_config.uva.cpu_offload_gb > 0
+            or self.offload_config.prefetch.offload_group_size > 0
+        ):
+            raise ValueError("Generic model offload cannot be combined with Tiered MoE")
+        return self
 
     @model_validator(mode="after")
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":

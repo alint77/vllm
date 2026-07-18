@@ -33,6 +33,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import (
     dbo_enabled,
     dbo_maybe_run_recv_hook,
@@ -1048,10 +1049,9 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.use_ep
         )
 
-    def _allocate_buffers(
+    def _buffer_shapes(
         self,
         out_dtype: torch.dtype,
-        device: torch.device,
         M_chunk: int,
         M_full: int,
         N: int,
@@ -1061,15 +1061,12 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Allocate temporary and output buffers for the fused experts op.
-        Inputs:
-        - out_dtype: output type of workspace and output tensors.
-        - device: the device of the workspace and output tensors.
-        See `workspace_shapes` for a description of the remainder of arguments.
-        Returns a tuple of (workspace13, workspace2, output) tensors.
-        """
+    ) -> tuple[
+        torch.dtype,
+        tuple[int, ...],
+        tuple[int, ...],
+        tuple[int, ...],
+    ]:
         assert M_full > 0 and M_chunk > 0
 
         workspace_dtype = self.fused_experts.workspace_dtype(out_dtype)
@@ -1098,6 +1095,47 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
+        return (
+            workspace_dtype,
+            workspace13_shape,
+            workspace2_shape,
+            fused_out_shape,
+        )
+
+    def _allocate_buffers(
+        self,
+        out_dtype: torch.dtype,
+        device: torch.device,
+        M_chunk: int,
+        M_full: int,
+        N: int,
+        K: int,
+        top_k: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Allocate temporary and output buffers for the fused experts op."""
+        del device
+        (
+            workspace_dtype,
+            workspace13_shape,
+            workspace2_shape,
+            fused_out_shape,
+        ) = self._buffer_shapes(
+            out_dtype,
+            M_chunk,
+            M_full,
+            N,
+            K,
+            top_k,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+
         # We can reuse the memory between cache1 and cache3 because by the
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
@@ -1110,6 +1148,71 @@ class FusedMoEKernelModularImpl:
         fused_out = _resize_cache(common_workspace, fused_out_shape)
 
         return workspace13, workspace2, fused_out
+
+    def _allocate_tiered_buffers(
+        self,
+        in_dtype: torch.dtype,
+        a1q: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        tiers: list[
+            tuple[
+                "FusedMoEKernel",
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
+        ],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        shapes = []
+        requests: list[tuple[tuple[int, ...], torch.dtype]] = []
+        for kernel, w1, w2, _ in tiers:
+            assert isinstance(kernel.impl, FusedMoEKernelModularImpl)
+            tier_impl = kernel.impl
+            _, M_full, N, K, top_k = tier_impl.fused_experts.moe_problem_size(
+                a1q, w1, w2, topk_ids
+            )
+            tier_shapes = tier_impl._buffer_shapes(
+                in_dtype,
+                M_full,
+                M_full,
+                N,
+                K,
+                top_k,
+                global_num_experts,
+                w1.shape[0],
+                expert_tokens_meta,
+                activation,
+            )
+            workspace_dtype, workspace13_shape, workspace2_shape, fused_out_shape = (
+                tier_shapes
+            )
+            shapes.append(tier_shapes)
+            requests.extend(
+                (
+                    (
+                        (max(prod(workspace13_shape), prod(fused_out_shape)),),
+                        workspace_dtype,
+                    ),
+                    (workspace2_shape, workspace_dtype),
+                )
+            )
+
+        allocations = current_workspace_manager().get_simultaneous(*requests)
+        buffers = []
+        for index, tier_shapes in enumerate(shapes):
+            _, workspace13_shape, _, fused_out_shape = tier_shapes
+            common_workspace = allocations[2 * index]
+            buffers.append(
+                (
+                    _resize_cache(common_workspace, workspace13_shape),
+                    allocations[2 * index + 1],
+                    _resize_cache(common_workspace, fused_out_shape),
+                )
+            )
+        return buffers
 
     def _maybe_apply_shared_experts(
         self,
@@ -1244,6 +1347,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1258,19 +1362,22 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
-        workspace13, workspace2, fused_out = self._allocate_buffers(
-            in_dtype,
-            a1q.device,
-            M_full,
-            M_full,
-            N,
-            K,
-            top_k,
-            global_num_experts,
-            local_num_experts,
-            expert_tokens_meta,
-            activation,
-        )
+        if buffers is None:
+            workspace13, workspace2, fused_out = self._allocate_buffers(
+                in_dtype,
+                a1q.device,
+                M_full,
+                M_full,
+                N,
+                K,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            )
+        else:
+            workspace13, workspace2, fused_out = buffers
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
@@ -1467,6 +1574,134 @@ class FusedMoEKernelModularImpl:
             hidden_states,
             topk_weights,
             topk_ids,
+            apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def apply_tiered(
+        self,
+        hidden_states: torch.Tensor,
+        tiers: list[
+            tuple[
+                "FusedMoEKernel",
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
+        ],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        prepare_expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run disjoint expert tiers behind one prepare/finalize pair."""
+        if not tiers:
+            raise ValueError("Tiered MoE requires at least one expert tier")
+        primary_impl = self
+        output = torch.empty_like(hidden_states)
+        (
+            a1q,
+            a1q_scale,
+            expert_tokens_meta,
+            prepared_topk_ids,
+            prepared_topk_weights,
+        ) = primary_impl._prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            prepare_expert_map,
+            apply_router_weight_on_input,
+        )
+
+        tier_stream = (
+            aux_stream() if len(tiers) == 2 and hidden_states.shape[0] <= 2 else None
+        )
+        if tier_stream is not None:
+            buffers = self._allocate_tiered_buffers(
+                hidden_states.dtype,
+                a1q,
+                prepared_topk_ids,
+                activation,
+                global_num_experts,
+                expert_tokens_meta,
+                tiers,
+            )
+
+            def run_tier(index: int) -> torch.Tensor:
+                kernel, w1, w2, expert_map = tiers[index]
+                assert isinstance(kernel.impl, FusedMoEKernelModularImpl)
+                return kernel.impl._fused_experts(
+                    in_dtype=hidden_states.dtype,
+                    a1q=a1q,
+                    a1q_scale=a1q_scale,
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=prepared_topk_weights,
+                    topk_ids=prepared_topk_ids,
+                    activation=activation,
+                    global_num_experts=global_num_experts,
+                    local_num_experts=w1.shape[0],
+                    expert_map=expert_map,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    expert_tokens_meta=expert_tokens_meta,
+                    buffers=buffers[index],
+                )
+
+            main_stream = current_stream()
+            tier_stream.wait_stream(main_stream)
+            with torch.cuda.stream(tier_stream):
+                cold_output = run_tier(1)
+            hot_output = run_tier(0)
+            main_stream.wait_stream(tier_stream)
+            combined_output = cold_output.add_(hot_output)
+        else:
+            combined_output = None
+        last_index = len(tiers) - 1
+        for index, (kernel, w1, w2, expert_map) in enumerate(tiers):
+            if tier_stream is not None:
+                break
+            if not isinstance(kernel.impl, FusedMoEKernelModularImpl):
+                raise TypeError("Tiered MoE requires modular expert kernels")
+            tier_impl = kernel.impl
+            fused_out = tier_impl._fused_experts(
+                in_dtype=hidden_states.dtype,
+                a1q=a1q,
+                a1q_scale=a1q_scale,
+                w1=w1,
+                w2=w2,
+                topk_weights=prepared_topk_weights,
+                topk_ids=prepared_topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                local_num_experts=w1.shape[0],
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_tokens_meta=expert_tokens_meta,
+            )
+            if len(tiers) == 1:
+                combined_output = fused_out
+            elif index == 0:
+                combined_output = fused_out.clone()
+            elif index == last_index:
+                assert combined_output is not None
+                combined_output = fused_out.add_(combined_output)
+            else:
+                assert combined_output is not None
+                combined_output.add_(fused_out)
+
+        assert combined_output is not None
+        return primary_impl._finalize(
+            output,
+            combined_output,
+            hidden_states,
+            prepared_topk_weights,
+            prepared_topk_ids,
             apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
@@ -1670,6 +1905,41 @@ class FusedMoEKernel:
             activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def apply_tiered(
+        self,
+        hidden_states: torch.Tensor,
+        tiers: list[
+            tuple[
+                "FusedMoEKernel",
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
+        ],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        prepare_expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run disjoint expert tiers behind one prepare/finalize pair."""
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.apply_tiered(
+            hidden_states=hidden_states,
+            tiers=tiers,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            prepare_expert_map=prepare_expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,

@@ -22,6 +22,8 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.load import LoadConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.models.deepseek_mtp import _get_mtp_quant_config
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -29,6 +31,19 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_mtp_quantization_override():
+    config = mock.MagicMock()
+    config.mtp_quantization_config = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+    }
+
+    quant_config = _get_mtp_quant_config(config)
+
+    assert isinstance(quant_config, Fp8Config)
+    assert quant_config.is_checkpoint_fp8_serialized
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:

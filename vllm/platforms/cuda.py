@@ -21,6 +21,7 @@ from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
 import vllm._C_stable_libtorch  # noqa
+import vllm._pageable_grace_C  # noqa
 
 with contextlib.suppress(ImportError):
     import vllm._qutlass_C  # noqa

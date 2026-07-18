@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization import (
     get_quantization_config,
 )
 from vllm.model_executor.model_loader.ep_weight_filter import (
+    parse_layer_expert_id,
     should_skip_weight,
 )
 from vllm.platforms import current_platform
@@ -843,20 +844,51 @@ def safetensors_weights_iterator(
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
     *,
+    local_expert_ids_by_layer: Mapping[int, Collection[int]] | None = None,
+    defer_split_experts: bool = False,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
-    When *local_expert_ids* is provided, expert weights not belonging to
-    this rank are skipped **before** reading from disk, which drastically
-    reduces storage I/O for MoE models under EP.
+    When an expert ownership filter is provided, expert weights not belonging
+    to this rank are skipped **before** reading from disk. Layer-aware maps
+    also skip non-local scale and metadata tensors.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    split_expert_files: dict[tuple[int, int], list[str]] = {}
+    if defer_split_experts:
+        if local_expert_ids_by_layer is None:
+            raise ValueError("Split-expert deferral requires a layer-aware map")
+        if safetensors_load_strategy in ("eager", "torchao"):
+            raise ValueError("Split-expert deferral requires lazy or prefetch loading")
+        expert_files: dict[tuple[int, int], list[str]] = defaultdict(list)
+        for st_file in sorted_files:
+            with safe_open(st_file, framework="pt") as f:
+                experts_in_file = {
+                    layer_expert
+                    for name in f.keys()  # noqa: SIM118
+                    if not should_skip_weight(
+                        name, local_expert_ids, local_expert_ids_by_layer
+                    )
+                    and (layer_expert := parse_layer_expert_id(name)) is not None
+                }
+            for layer_expert in experts_in_file:
+                expert_files[layer_expert].append(st_file)
+        split_expert_files = {
+            layer_expert: files
+            for layer_expert, files in expert_files.items()
+            if len(files) > 1
+        }
+        logger.info_once(
+            "Deferring %d local experts split across checkpoint shards",
+            len(split_expert_files),
+        )
 
     fs_type = _get_fs_type(sorted_files)
     is_net_fs = fs_type in ("nfs", "nfs4", "lustre")
@@ -933,7 +965,9 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not should_skip_weight(
+                    name, local_expert_ids, local_expert_ids_by_layer
+                ):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -950,7 +984,9 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if should_skip_weight(
+                        name, local_expert_ids, local_expert_ids_by_layer
+                    ):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -968,10 +1004,22 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if should_skip_weight(
+                        name, local_expert_ids, local_expert_ids_by_layer
+                    ):
+                        continue
+                    if parse_layer_expert_id(name) in split_expert_files:
                         continue
                     param = f.get_tensor(name)
                     yield name, param
+
+    for layer_expert, files in sorted(split_expert_files.items()):
+        for st_file in files:
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():  # noqa: SIM118
+                    if parse_layer_expert_id(name) != layer_expert:
+                        continue
+                    yield name, f.get_tensor(name)
 
 
 def multi_thread_safetensors_weights_iterator(

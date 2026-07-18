@@ -1137,6 +1137,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 endif()
 
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  define_extension_target(
+    _pageable_grace_C
+    DESTINATION vllm
+    LANGUAGE CXX
+    SOURCES "csrc/pageable_grace_view.cpp"
+    LIBRARIES CUDA::cudart
+    USE_SABI 3.8
+    WITH_SOABI)
+endif()
+
 #
 # _moe_C_stable_libtorch extension
 #

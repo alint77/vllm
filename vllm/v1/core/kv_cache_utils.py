@@ -1379,13 +1379,34 @@ def get_kv_cache_config_from_groups(
         )
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-        kv_cache_tensors = [
-            KVCacheTensor(
-                size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
-                shared_by=[layer_name],
-            )
-            for layer_name in kv_cache_groups[0].layer_names
-        ]
+        kv_cache_tensors = []
+        for layer_name in kv_cache_groups[0].layer_names:
+            spec = per_layer_specs[layer_name]
+            if vllm_config.tiered_moe_config.enabled:
+                from vllm.model_executor.model_loader.tiered_moe_kv import (
+                    get_tiered_kv_memory_tier,
+                )
+
+                memory_tier, capacity_domain = get_tiered_kv_memory_tier(
+                    vllm_config, spec
+                )
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=spec.page_size_bytes * num_blocks,
+                        shared_by=[layer_name],
+                        memory_tier=memory_tier,
+                        capacity_domain=capacity_domain,
+                        bytes_per_block=spec.page_size_bytes,
+                        planned_blocks=num_blocks,
+                    )
+                )
+            else:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=spec.page_size_bytes * num_blocks,
+                        shared_by=[layer_name],
+                    )
+                )
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
@@ -2099,6 +2120,21 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
 
+    if vllm_config.tiered_moe_config.enabled:
+        from vllm.model_executor.model_loader.tiered_moe_kv import (
+            get_tiered_kv_available_memory,
+        )
+
+        tiered_available_memory = [
+            get_tiered_kv_available_memory(vllm_config, groups)
+            for groups in projected_groups_per_worker
+        ]
+        if any(memory is None for memory in tiered_available_memory):
+            raise AssertionError("Tiered KV capacity was not resolved")
+        available_memory = [
+            memory for memory in tiered_available_memory if memory is not None
+        ]
+
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
     # `may_override_num_blocks` in `get_kv_cache_config_from_groups` clamps
@@ -2164,6 +2200,8 @@ def get_kv_cache_configs(
         for tensor in kv_cache_config.kv_cache_tensors:
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            if tensor.planned_blocks:
+                tensor.planned_blocks = min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

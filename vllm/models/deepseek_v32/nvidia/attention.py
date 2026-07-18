@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -106,6 +108,12 @@ class DeepseekV32Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
         )
+        self.index_trace_capture_fn: Callable[[torch.Tensor], None] | None = None
+
+    def set_index_trace_capture_fn(
+        self, capture_fn: Callable[[torch.Tensor], None]
+    ) -> None:
+        self.index_trace_capture_fn = capture_fn
 
     def forward(
         self,
@@ -154,7 +162,10 @@ class DeepseekV32Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        topk_indices = self.indexer_op(hidden_states, q_fp8, k, weights)
+        if self.index_trace_capture_fn is not None:
+            self.index_trace_capture_fn(topk_indices)
+        return topk_indices
 
 
 class DeepseekV32Attention(MLAAttention):

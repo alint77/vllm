@@ -60,6 +60,7 @@ from vllm.config import (
     SchedulerConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
+    TieredMoEConfig,
     UVAOffloadConfig,
     VllmConfig,
     WeightTransferConfig,
@@ -523,6 +524,16 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    enable_tiered_moe: bool = TieredMoEConfig.enabled
+    tiered_moe_backend: str = TieredMoEConfig.backend
+    tiered_moe_placement_profile: str | None = TieredMoEConfig.placement_profile
+    tiered_moe_routing_trace_output: str | None = TieredMoEConfig.routing_trace_output
+    tiered_moe_hbm_reserve_gb: float = TieredMoEConfig.hbm_reserve_gb
+    tiered_moe_host_reserve_gb: float = TieredMoEConfig.host_reserve_gb
+    tiered_moe_numa_strict: bool = TieredMoEConfig.numa_strict
+    tiered_moe_plan_only: bool = TieredMoEConfig.plan_only
+    mla_cache_tier: str = TieredMoEConfig.mla_cache_tier
+    grace_machine_profile: str | None = TieredMoEConfig.grace_machine_profile
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1238,6 +1249,47 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
+        )
+
+        tiered_moe_kwargs = get_kwargs(TieredMoEConfig)
+        tiered_moe_group = parser.add_argument_group(
+            title="TieredMoEConfig",
+            description=TieredMoEConfig.__doc__,
+        )
+        tiered_moe_group.add_argument(
+            "--enable-tiered-moe", **tiered_moe_kwargs["enabled"]
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-backend", **tiered_moe_kwargs["backend"]
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-placement-profile",
+            **tiered_moe_kwargs["placement_profile"],
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-routing-trace-output",
+            **tiered_moe_kwargs["routing_trace_output"],
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-hbm-reserve-gb",
+            **tiered_moe_kwargs["hbm_reserve_gb"],
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-host-reserve-gb",
+            **tiered_moe_kwargs["host_reserve_gb"],
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-numa-strict", **tiered_moe_kwargs["numa_strict"]
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-plan-only", **tiered_moe_kwargs["plan_only"]
+        )
+        tiered_moe_group.add_argument(
+            "--mla-cache-tier", **tiered_moe_kwargs["mla_cache_tier"]
+        )
+        tiered_moe_group.add_argument(
+            "--grace-machine-profile",
+            **tiered_moe_kwargs["grace_machine_profile"],
         )
 
         # Multimodal related configs
@@ -2359,6 +2411,18 @@ class EngineArgs:
                 offload_params=self.offload_params,
             ),
         )
+        tiered_moe_config = TieredMoEConfig(
+            enabled=self.enable_tiered_moe,
+            backend=self.tiered_moe_backend,
+            placement_profile=self.tiered_moe_placement_profile,
+            routing_trace_output=self.tiered_moe_routing_trace_output,
+            hbm_reserve_gb=self.tiered_moe_hbm_reserve_gb,
+            host_reserve_gb=self.tiered_moe_host_reserve_gb,
+            numa_strict=self.tiered_moe_numa_strict,
+            plan_only=self.tiered_moe_plan_only,
+            mla_cache_tier=self.mla_cache_tier,
+            grace_machine_profile=self.grace_machine_profile,
+        )
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
@@ -2371,6 +2435,7 @@ class EngineArgs:
             device_config=device_config,
             load_config=load_config,
             offload_config=offload_config,
+            tiered_moe_config=tiered_moe_config,
             attention_config=attention_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,

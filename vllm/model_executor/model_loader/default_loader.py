@@ -5,13 +5,13 @@ import glob
 import os
 import time
 from collections.abc import Generator, Iterable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
@@ -38,6 +38,11 @@ from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.model_executor.model_loader.tiered_moe_physical import (
+        TieredMoERankLoadPlan,
+    )
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -74,6 +79,8 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         self.local_expert_ids: set[int] | None = None
+        self.local_expert_ids_by_layer: dict[int, tuple[int, ...]] | None = None
+        self.tiered_moe_load_plan: TieredMoERankLoadPlan | None = None
 
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
@@ -289,6 +296,10 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        local_expert_ids_by_layer=self.local_expert_ids_by_layer,
+                        defer_split_experts=(
+                            self.local_expert_ids_by_layer is not None
+                        ),
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -348,16 +359,27 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides=None,
         )
 
-    def _init_ep_weight_filter(self, model_config: ModelConfig) -> None:
+    def _init_ep_weight_filter(
+        self,
+        model_config: ModelConfig,
+        vllm_config: VllmConfig | None = None,
+    ) -> None:
         """Compute local expert ids for EP weight filtering.
 
         When expert parallelism is active, each rank only needs a subset of
         expert weights.  By computing the set upfront we can skip non-local
         expert tensors *before* reading them from disk.
         """
-        from vllm.config import get_current_vllm_config
+        if (
+            self.local_expert_ids is not None
+            or self.local_expert_ids_by_layer is not None
+        ):
+            return
 
-        vllm_config = get_current_vllm_config()
+        if vllm_config is None:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
 
         if not (
@@ -396,6 +418,64 @@ class DefaultModelLoader(BaseModelLoader):
         ep_size = dp_size * pcp_size * tp_size
         ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
 
+        hf_config = model_config.hf_config
+        is_mtp_draft = getattr(hf_config, "model_type", None) == "deepseek_mtp"
+        if is_mtp_draft:
+            local_ids = compute_local_expert_ids(
+                num_experts,
+                ep_size,
+                ep_rank,
+                placement=parallel_config.expert_placement_strategy,
+            )
+            assert local_ids is not None
+            first_moe_layer = getattr(hf_config, "first_k_dense_replace", 0)
+            spec_start = hf_config.num_hidden_layers
+            self.local_expert_ids_by_layer = {
+                layer_id: () for layer_id in range(first_moe_layer, spec_start)
+            }
+            for layer_id in range(
+                spec_start,
+                spec_start + hf_config.num_nextn_predict_layers,
+            ):
+                self.local_expert_ids_by_layer[layer_id] = tuple(sorted(local_ids))
+            logger.info_once(
+                "MTP EP weight filter: ep_size=%d, ep_rank=%d, loading %d/%d "
+                "draft experts",
+                ep_size,
+                ep_rank,
+                len(local_ids),
+                num_experts,
+            )
+            return
+        if vllm_config.tiered_moe_config.enabled:
+            extra_config = self.load_config.model_loader_extra_config
+            if extra_config.get("enable_multithread_load"):
+                raise ValueError(
+                    "Tiered MoE does not support multithreaded weight loading"
+                )
+            from vllm.model_executor.model_loader.tiered_moe_physical import (
+                build_tiered_moe_rank_load_plan,
+            )
+
+            load_plan = build_tiered_moe_rank_load_plan(vllm_config, ep_rank)
+            self.tiered_moe_load_plan = load_plan
+            self.local_expert_ids_by_layer = dict(
+                load_plan.rank_plan.owned_expert_ids_by_layer
+            )
+            spec_start = getattr(hf_config, "num_hidden_layers", 0)
+            spec_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+            for layer_id in range(spec_start, spec_start + spec_layers):
+                self.local_expert_ids_by_layer.setdefault(layer_id, ())
+            logger.info_once(
+                "Tiered EP weight filter: ep_size=%d, ep_rank=%d, "
+                "loading %d experts across %d routed layers",
+                ep_size,
+                ep_rank,
+                len(next(iter(self.local_expert_ids_by_layer.values()))),
+                len(self.local_expert_ids_by_layer),
+            )
+            return
+
         self.local_expert_ids = compute_local_expert_ids(
             num_experts,
             ep_size,
@@ -411,6 +491,20 @@ class DefaultModelLoader(BaseModelLoader):
                 num_experts,
             )
 
+    def load_model(
+        self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+    ) -> nn.Module:
+        """Resolve tiered placement before model parameter construction."""
+        self._init_ep_weight_filter(model_config, vllm_config)
+        if self.tiered_moe_load_plan is None:
+            return super().load_model(vllm_config, model_config, prefix)
+        from vllm.model_executor.model_loader.tiered_moe_physical import (
+            use_tiered_moe_rank_load_plan,
+        )
+
+        with use_tiered_moe_rank_load_plan(self.tiered_moe_load_plan):
+            return super().load_model(vllm_config, model_config, prefix)
+
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         if model_config.quantization == "torchao":
@@ -424,7 +518,18 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        weights = self.get_all_weights(model_config, model)
+        if self.tiered_moe_load_plan is None:
+            loaded_weights = model.load_weights(weights)
+        else:
+            from vllm.model_executor.model_loader.tiered_moe_streaming import (
+                TieredMoEExpertLoader,
+            )
+
+            device_index = torch.accelerator.current_device_index()
+            streamer = TieredMoEExpertLoader(model, torch.device("cuda", device_index))
+            loaded_weights = model.load_weights(streamer.filter(weights))
+            streamer.finish()
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import json
 import signal
 import time
 
@@ -51,6 +52,19 @@ class ServeSubcommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
+
+        if getattr(args, "tiered_moe_plan_only", False):
+            engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+            vllm_config = engine_args.create_engine_config(
+                usage_context=UsageContext.OPENAI_API_SERVER
+            )
+            from vllm.entrypoints.tiered_moe_plan import (
+                build_tiered_moe_plan_from_vllm_config,
+            )
+
+            plan = build_tiered_moe_plan_from_vllm_config(vllm_config)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return
 
         if getattr(args, "grpc", False):
             from vllm.entrypoints.grpc_server import serve_grpc

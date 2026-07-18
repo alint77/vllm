@@ -174,7 +174,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
                 logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                 return CompressedTensorsWNA16MarlinMoEMethod(
-                    weight_quant, input_quant, layer.moe_config
+                    weight_quant, input_quant, layer.moe_config, layer_name
                 )
         elif quant_config._is_nvfp4_format(weight_quant):
             from .compressed_tensors_moe_w4a4_nvfp4 import (

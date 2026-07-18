@@ -940,6 +940,10 @@ class KVCacheTensor:
     shared_by: list[str]  # layer names that share the same KV cache tensor
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    memory_tier: str = "hbm"
+    capacity_domain: str = "gpu_rank"
+    bytes_per_block: int = 0
+    planned_blocks: int = 0
 
 
 @dataclass

@@ -17,7 +17,10 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,6 +42,13 @@ from .deepseek_v2 import (
 from .utils import get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def _get_mtp_quant_config(config: PretrainedConfig) -> QuantizationConfig | None:
+    quant_config = getattr(config, "mtp_quantization_config", None)
+    if not quant_config or not (quant_method := quant_config.get("quant_method")):
+        return None
+    return get_quantization_config(quant_method).from_config(quant_config)
 
 
 def _restore_full_token_layout_if_needed(
@@ -114,6 +124,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             prefix,
             config=self.config,
             topk_indices_buffer=topk_indices_buffer,
+            quant_config_override=_get_mtp_quant_config(config),
         )
 
     def forward(

@@ -12,6 +12,7 @@ import torch
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
     parse_expert_id,
+    parse_layer_expert_id,
     should_skip_weight,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -67,6 +68,10 @@ class TestParseExpertId:
     def test_expert_zero_id(self):
         name = "model.layers.0.mlp.experts.0.up_proj.weight"
         assert parse_expert_id(name) == 0
+
+    def test_layer_expert_id(self):
+        name = "model.layers.74.mlp.experts.255.down_proj.weight_scale"
+        assert parse_layer_expert_id(name) == (74, 255)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +189,29 @@ class TestShouldSkipWeight:
         assert should_skip_weight(
             "model.layers.0.mlp.experts.200.gate_proj.weight", self.local_ids
         )
+
+    def test_remote_packed_expert_skipped(self):
+        assert should_skip_weight(
+            "model.layers.0.mlp.experts.200.gate_proj.weight_packed",
+            self.local_ids,
+        )
+
+    def test_generic_filter_keeps_remote_scale(self):
+        assert not should_skip_weight(
+            "model.layers.0.mlp.experts.200.gate_proj.weight_scale",
+            self.local_ids,
+        )
+
+    def test_layer_filter_skips_every_remote_component(self):
+        layer_map = {3: {0, 1}}
+        for component in ("weight_packed", "weight_scale", "weight_shape"):
+            name = f"model.layers.3.mlp.experts.2.gate_proj.{component}"
+            assert should_skip_weight(name, None, layer_map)
+
+    def test_layer_filter_fails_without_layer_map(self):
+        name = "model.layers.4.mlp.experts.2.gate_proj.weight_packed"
+        with pytest.raises(ValueError, match="no map for layer 4"):
+            should_skip_weight(name, None, {3: {2}})
 
     def test_boundary_expert(self):
         # Expert 47 is local (last one), 48 is not
@@ -359,3 +387,96 @@ class TestEpFilterOnSyntheticMoeWeights:
 
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
+
+    def test_layer_filter_skips_quantized_payload_before_read(
+        self, tmp_path, monkeypatch
+    ):
+        from safetensors.torch import save_file
+
+        from vllm.model_executor.model_loader import weight_utils
+
+        tensors = {"model.norm.weight": torch.ones(1)}
+        for expert_id in (0, 1):
+            for component in ("weight_packed", "weight_scale", "weight_shape"):
+                name = f"model.layers.3.mlp.experts.{expert_id}.gate_proj.{component}"
+                tensors[name] = torch.ones(1)
+        filepath = str(tmp_path / "model.safetensors")
+        save_file(tensors, filepath)
+
+        accessed = []
+        original_safe_open = weight_utils.safe_open
+
+        class TrackedSafeOpen:
+            def __init__(self, *args, **kwargs):
+                self.inner = original_safe_open(*args, **kwargs)
+
+            def __enter__(self):
+                self.open_file = self.inner.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+            def keys(self):
+                return self.open_file.keys()
+
+            def get_tensor(self, name):
+                accessed.append(name)
+                return self.open_file.get_tensor(name)
+
+        monkeypatch.setattr(weight_utils, "safe_open", TrackedSafeOpen)
+
+        loaded = dict(
+            safetensors_weights_iterator(
+                [filepath],
+                False,
+                local_expert_ids_by_layer={3: {0}},
+            )
+        )
+
+        assert "model.norm.weight" in loaded
+        local_names = [name for name in loaded if parse_expert_id(name) == 0]
+        remote_names = [name for name in loaded if parse_expert_id(name) == 1]
+        assert len(local_names) == 3
+        assert remote_names == []
+        assert all(parse_expert_id(name) != 1 for name in accessed)
+
+    def test_split_expert_is_deferred_as_one_complete_bundle(self, tmp_path):
+        from safetensors.torch import save_file
+
+        def name(expert, projection, component):
+            return f"model.layers.3.mlp.experts.{expert}.{projection}.{component}"
+
+        projections = ("down_proj", "gate_proj", "up_proj")
+        components = ("weight_packed", "weight_scale", "weight_shape")
+        first = {
+            name(0, "down_proj", component): torch.ones(1) for component in components
+        }
+        first.update(
+            {
+                name(1, projection, component): torch.ones(1)
+                for projection in projections
+                for component in components
+            }
+        )
+        second = {
+            name(0, projection, component): torch.ones(1)
+            for projection in ("gate_proj", "up_proj")
+            for component in components
+        }
+        files = [str(tmp_path / f"model-{index}.safetensors") for index in (1, 2)]
+        save_file(first, files[0])
+        save_file(second, files[1])
+
+        names = [
+            name
+            for name, _ in safetensors_weights_iterator(
+                files,
+                False,
+                local_expert_ids_by_layer={3: {0, 1}},
+                defer_split_experts=True,
+            )
+        ]
+        expert_keys = [parse_layer_expert_id(name) for name in names]
+
+        assert expert_keys == [(3, 1)] * 9 + [(3, 0)] * 9

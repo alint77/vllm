@@ -381,9 +381,7 @@ class CommunicatorBenchmark:
 
         except Exception as e:
             logger.error("CUDA graph benchmark failed: %s", e)
-            raise RuntimeError(
-                f"CUDA graph benchmark failed for communicator: {e}"
-            ) from e
+            return None
 
 
 def _calculate_speedup_info(comm_results: dict[str, float]) -> str:
@@ -465,6 +463,8 @@ def print_results(
 
 
 def main():
+    global HIDDEN_SIZE
+
     parser = FlexibleArgumentParser(description="Benchmark device communicators")
 
     parser.add_argument(
@@ -473,6 +473,10 @@ def main():
         nargs="+",
         default=DEFAULT_SEQUENCE_LENGTHS,
         help="Sequence lengths to benchmark (tensor shape: seq_len x hidden_size)",
+    )
+
+    parser.add_argument(
+        "--hidden-size", type=int, default=HIDDEN_SIZE, help="Hidden size"
     )
 
     parser.add_argument(
@@ -486,6 +490,7 @@ def main():
     parser.add_argument("--output-json", type=str, help="Output results to JSON file")
 
     args = parser.parse_args()
+    HIDDEN_SIZE = args.hidden_size
 
     # Initialize distributed
     if not dist.is_initialized():

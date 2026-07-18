@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 from torch import nn
 
+import vllm.config
+import vllm.distributed
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
@@ -88,3 +92,112 @@ def test_default_loader_hf_still_falls_back_to_pt(tmp_path):
     )
     assert use_safetensors is False
     assert any(f.endswith("model.pt") for f in files)
+
+
+def test_default_loader_passes_tiered_layer_map_to_safetensors(monkeypatch):
+    from vllm.model_executor.model_loader import default_loader, tiered_moe_physical
+
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    parallel = SimpleNamespace(
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=True,
+        enable_eplb=False,
+        data_parallel_size=1,
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        expert_placement_strategy="linear",
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel,
+        tiered_moe_config=SimpleNamespace(enabled=True),
+    )
+    model_config = SimpleNamespace(
+        is_moe=True,
+        model="/model",
+        hf_config=SimpleNamespace(
+            model_type="glm_moe_dsa",
+            num_hidden_layers=5,
+            num_nextn_predict_layers=1,
+        ),
+        get_num_experts=lambda: 8,
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 2)
+    monkeypatch.setattr(
+        tiered_moe_physical,
+        "build_tiered_moe_rank_load_plan",
+        lambda config, rank: SimpleNamespace(
+            rank_plan=SimpleNamespace(owned_expert_ids_by_layer={3: (4, 5), 4: (4, 5)})
+        ),
+    )
+    loader._init_ep_weight_filter(model_config)
+
+    captured = {}
+
+    def fake_iterator(*args, **kwargs):
+        captured.update(kwargs)
+        yield "dense.weight", nn.Parameter()
+
+    monkeypatch.setattr(default_loader, "safetensors_weights_iterator", fake_iterator)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *args, **kwargs: ("/model", ["model.safetensors"], True),
+    )
+    source = DefaultModelLoader.Source("/model", revision=None)
+
+    assert [name for name, _ in loader._get_weights_iterator(source)] == [
+        "dense.weight"
+    ]
+    assert captured["local_expert_ids"] is None
+    assert captured["local_expert_ids_by_layer"] == {
+        3: (4, 5),
+        4: (4, 5),
+        5: (),
+    }
+
+
+def test_default_loader_uses_native_ep_filter_for_mtp_draft(monkeypatch):
+    from vllm.model_executor.model_loader import tiered_moe_physical
+
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    parallel = SimpleNamespace(
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=True,
+        enable_eplb=False,
+        data_parallel_size=1,
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        expert_placement_strategy="linear",
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel,
+        tiered_moe_config=SimpleNamespace(enabled=True),
+    )
+    model_config = SimpleNamespace(
+        is_moe=True,
+        hf_config=SimpleNamespace(
+            model_type="deepseek_mtp",
+            first_k_dense_replace=1,
+            num_hidden_layers=3,
+            num_nextn_predict_layers=1,
+        ),
+        get_num_experts=lambda: 8,
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 2)
+    monkeypatch.setattr(
+        tiered_moe_physical,
+        "build_tiered_moe_rank_load_plan",
+        lambda *_: pytest.fail("MTP draft must not use the target tier plan"),
+    )
+
+    loader._init_ep_weight_filter(model_config)
+
+    assert loader.local_expert_ids is None
+    assert loader.local_expert_ids_by_layer == {
+        1: (),
+        2: (),
+        3: (4, 5),
+    }
+    assert loader.tiered_moe_load_plan is None

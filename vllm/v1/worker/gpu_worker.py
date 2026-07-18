@@ -429,6 +429,7 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        self.model_runner.init_dsa_index_trace_capturer()
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -896,6 +897,23 @@ class Worker(WorkerBase):
             )
 
             trigger_inductor_lazy_init(self.device)
+
+        if self.vllm_config.tiered_moe_config.enabled:
+            from vllm.model_executor.model_loader.tiered_moe_physical import (
+                validate_tiered_moe_observed_hbm_reserve,
+            )
+
+            torch.accelerator.synchronize(self.device)
+            torch.accelerator.empty_cache()
+            free_hbm, _ = torch.accelerator.get_memory_info(self.device)
+            required_free = validate_tiered_moe_observed_hbm_reserve(
+                self.vllm_config, free_hbm
+            )
+            logger.info(
+                "Tiered MoE observed HBM reserve: %.2f GiB free (minimum %.2f GiB)",
+                free_hbm / GiB_bytes,
+                required_free / GiB_bytes,
+            )
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.

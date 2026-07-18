@@ -781,6 +781,54 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
         )
 
 
+def is_pageable_accelerator_view_supported(device_index: int | None = None) -> bool:
+    """Return whether CUDA can directly access pageable CPU memory."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    pageable_memory_access = torch.ops._C_cuda_utils.get_device_attribute(
+        88, device_index
+    )
+    uses_host_page_tables = torch.ops._C_cuda_utils.get_device_attribute(
+        100, device_index
+    )
+    return bool(pageable_memory_access and uses_host_page_tables)
+
+
+def get_pageable_accelerator_view_from_cpu_tensor(
+    cpu_tensor: torch.Tensor, device_index: int | None = None
+) -> torch.Tensor:
+    """Create a CUDA alias of an ordinary pageable CPU tensor.
+
+    The returned tensor shares the input's address and keeps the CPU owner alive.
+    This requires CUDA pageable-memory access through the host page tables.
+
+    Args:
+        cpu_tensor: Contiguous, 64-byte-aligned tensor in pageable CPU memory.
+        device_index: CUDA device that will access the tensor. Defaults to the
+            current accelerator device.
+
+    Returns:
+        A CUDA tensor aliasing the input storage.
+
+    Raises:
+        ValueError: If the active platform is not CUDA.
+        RuntimeError: If the tensor or CUDA device does not meet the contract.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        raise ValueError(
+            "`get_pageable_accelerator_view_from_cpu_tensor` requires CUDA"
+        )
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    return torch.ops._C.get_cuda_pageable_view_from_cpu_tensor(cpu_tensor, device_index)
+
+
 # Helper function used in testing.
 def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
     return version.parse(torch_version) >= version.parse(target)

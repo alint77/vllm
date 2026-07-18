@@ -8,6 +8,8 @@ majority of storage I/O for MoE models (experts typically account for
 ~85-90 % of total weight bytes).
 """
 
+from collections.abc import Collection, Mapping
+
 import regex as re
 
 # Matches per-expert weight names like ".experts.42.gate_proj.weight".
@@ -15,6 +17,7 @@ import regex as re
 # (no numeric id) — those are intentionally left unfiltered so the full
 # tensor is loaded and sliced later by RoutedExperts.weight_loader.
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+_LAYER_EXPERT_ID_RE = re.compile(r"\.layers\.(\d+)\..*\.experts\.(\d+)\.")
 
 
 def parse_expert_id(weight_name: str) -> int | None:
@@ -26,6 +29,15 @@ def parse_expert_id(weight_name: str) -> int | None:
     in a single tensor without a numeric expert id in the name."""
     m = _EXPERT_ID_RE.search(weight_name)
     return int(m.group(1)) if m else None
+
+
+def parse_layer_expert_id(weight_name: str) -> tuple[int, int] | None:
+    """Return the layer and expert IDs in a per-expert tensor name."""
+    match = _LAYER_EXPERT_ID_RE.search(weight_name)
+    if match is None:
+        return None
+    layer_id, expert_id = match.groups()
+    return int(layer_id), int(expert_id)
 
 
 def compute_local_expert_ids(
@@ -64,18 +76,32 @@ def compute_local_expert_ids(
 def should_skip_weight(
     weight_name: str,
     local_expert_ids: set[int] | None,
+    local_expert_ids_by_layer: Mapping[int, Collection[int]] | None = None,
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
     belong to the local rank and should be skipped during loading."""
-    if local_expert_ids is None:
+    if local_expert_ids is None and local_expert_ids_by_layer is None:
         return False
     eid = parse_expert_id(weight_name)
     if eid is None:
         # Not an expert weight (dense / shared-expert / embedding) → keep.
         return False
+    if local_expert_ids_by_layer is not None:
+        layer_expert_id = parse_layer_expert_id(weight_name)
+        if layer_expert_id is None:
+            raise ValueError(
+                f"Layer-aware EP filter cannot classify expert tensor: {weight_name}"
+            )
+        layer_id, eid = layer_expert_id
+        layer_local_ids = local_expert_ids_by_layer.get(layer_id)
+        if layer_local_ids is None:
+            raise ValueError(f"Layer-aware EP filter has no map for layer {layer_id}")
+        return eid not in layer_local_ids
+
+    assert local_expert_ids is not None
     # Only skip heavy weight tensors, never scale/metadata tensors.
     # Scale tensors are tiny and some backends need them from ALL experts
     # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
-    if not weight_name.endswith(".weight"):
+    if not weight_name.endswith((".weight", ".weight_packed")):
         return False
     return eid not in local_expert_ids

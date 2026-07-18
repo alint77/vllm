@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
+    VLLM_DSA_INDEX_TRACE_DIR: str | None = None
+    VLLM_DSA_INDEX_TRACE_INTERVAL: int = 16
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -838,6 +840,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+    "VLLM_DSA_INDEX_TRACE_DIR": lambda: os.getenv("VLLM_DSA_INDEX_TRACE_DIR"),
+    "VLLM_DSA_INDEX_TRACE_INTERVAL": lambda: int(
+        os.getenv("VLLM_DSA_INDEX_TRACE_INTERVAL", "16")
+    ),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.

@@ -282,6 +282,7 @@ class DeepseekV2MoE(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        is_sequence_parallel: bool | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -295,7 +296,11 @@ class DeepseekV2MoE(nn.Module):
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.is_sequence_parallel = (
+            parallel_config.use_sequence_parallel_moe
+            if is_sequence_parallel is None
+            else is_sequence_parallel
+        )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -721,6 +726,17 @@ class Indexer(nn.Module):
             and self.rope_dim == 64
             and self.scale_fmt is not None
         )
+        self.index_trace_capture_fn: Callable[[torch.Tensor], None] | None = None
+
+    def set_index_trace_capture_fn(
+        self, capture_fn: Callable[[torch.Tensor], None]
+    ) -> None:
+        self.index_trace_capture_fn = capture_fn
+
+    def _capture_index_trace(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        if self.index_trace_capture_fn is not None:
+            self.index_trace_capture_fn(topk_indices)
+        return topk_indices
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -773,7 +789,9 @@ class Indexer(nn.Module):
             k_pe = k_pe.reshape(-1, self.rope_dim)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-            return self.indexer_op(hidden_states, q_fp8, k, weights)
+            return self._capture_index_trace(
+                self.indexer_op(hidden_states, q_fp8, k, weights)
+            )
         else:
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -813,7 +831,9 @@ class Indexer(nn.Module):
 
         weights = weights * q_scale * self.softmax_scale * self.n_head_scale
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        return self._capture_index_trace(
+            self.indexer_op(hidden_states, q_fp8, k, weights)
+        )
 
 
 def _try_load_fp8_indexer_wk(
@@ -1180,6 +1200,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        quant_config_override: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -1187,7 +1208,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
+        quant_config = quant_config_override or vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
@@ -1224,6 +1245,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # send/receive sequence-parallel hidden_states across stages.
         self.use_sequence_parallel_moe = (
             parallel_config.use_sequence_parallel_moe
+            and not vllm_config.tiered_moe_config.enabled
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
@@ -1250,6 +1272,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 parallel_config=parallel_config,
                 quant_config=quant_config,
+                is_sequence_parallel=self.use_sequence_parallel_moe,
                 prefix=f"{prefix}.mlp",
                 # aiter applies routed_scaling_factor internally
                 apply_routed_scale_to_output=not rocm_aiter_ops.is_fused_moe_enabled(),
