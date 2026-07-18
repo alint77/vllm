@@ -1619,9 +1619,8 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
         )
 
-        tier_stream = (
-            aux_stream() if len(tiers) == 2 and hidden_states.shape[0] <= 2 else None
-        )
+        num_tokens = hidden_states.shape[0]
+        tier_stream = aux_stream() if len(tiers) == 2 and num_tokens <= 4 else None
         if tier_stream is not None:
             buffers = self._allocate_tiered_buffers(
                 hidden_states.dtype,

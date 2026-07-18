@@ -23,7 +23,10 @@ from vllm.config import (
 )
 from vllm.config.load import LoadConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.models.deepseek_mtp import _get_mtp_quant_config
+from vllm.model_executor.models.deepseek_mtp import (
+    DeepSeekMultiTokenPredictor,
+    _get_mtp_quant_config,
+)
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -44,6 +47,30 @@ def test_mtp_quantization_override():
 
     assert isinstance(quant_config, Fp8Config)
     assert quant_config.is_checkpoint_fp8_serialized
+
+
+def test_deepseek_mtp_local_argmax_uses_shared_head():
+    hidden_states = torch.randn(2, 8)
+    normalized_states = torch.randn(2, 8)
+    expected_tokens = torch.tensor([3, 5])
+    shared_head = mock.MagicMock()
+    shared_head.head = mock.sentinel.lm_head
+    shared_head.return_value = normalized_states
+    logits_processor = mock.MagicMock()
+    logits_processor.get_top_tokens.return_value = expected_tokens
+    predictor = mock.MagicMock()
+    predictor.num_mtp_layers = 1
+    predictor.mtp_start_layer_idx = 78
+    predictor.layers = {"78": mock.MagicMock(shared_head=shared_head)}
+    predictor.logits_processor = logits_processor
+
+    result = DeepSeekMultiTokenPredictor.get_top_tokens(predictor, hidden_states)
+
+    assert result is expected_tokens
+    shared_head.assert_called_once_with(hidden_states)
+    logits_processor.get_top_tokens.assert_called_once_with(
+        shared_head.head, normalized_states
+    )
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
