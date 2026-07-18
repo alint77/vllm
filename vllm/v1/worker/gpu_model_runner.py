@@ -6573,6 +6573,28 @@ class GPUModelRunner(
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+        if self.parallel_config.decode_context_parallel_size > 1:
+            # FULL-graph profiling capture (temporary pool + minimal KV cache)
+            # hard-crashes when the graph contains DCP collectives; the real
+            # capture_model pass with the persistent pool and final KV cache
+            # captures the same graph fine. Profile only the piecewise graphs
+            # and let the shared-memory margin cover the FULL estimate.
+            skipped = sum(
+                len(descs)
+                for mode, descs in capture_descs
+                if mode == CUDAGraphMode.FULL
+            )
+            if skipped:
+                logger.info(
+                    "Skipping FULL CUDA graph memory profiling under DCP "
+                    "(%d graph(s)); estimating from piecewise graphs only",
+                    skipped,
+                )
+            capture_descs = [
+                (mode, descs)
+                for mode, descs in capture_descs
+                if mode != CUDAGraphMode.FULL
+            ]
         # Use a temporary manager for memory profiling. The persistent manager
         # is initialized later so it does not keep profiling-only graph state.
         encoder_cudagraph_manager = self._create_encoder_cudagraph_manager()
