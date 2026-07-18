@@ -2273,9 +2273,23 @@ class VllmConfig:
             or parallel.data_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
         ):
-            raise ValueError("Tiered MoE initially requires TP4, DP1, PP1, PCP1, DCP1")
+            raise ValueError("Tiered MoE initially requires TP4, DP1, PP1, PCP1")
+        if parallel.decode_context_parallel_size not in (1, 4):
+            raise ValueError("Tiered MoE supports DCP1 or full-TP-group DCP4")
+        if (
+            parallel.decode_context_parallel_size > 1
+            and parallel.cp_kv_cache_interleave_size != 1
+        ):
+            raise ValueError("Tiered MoE DCP requires cp_kv_cache_interleave_size=1")
+        if (
+            parallel.decode_context_parallel_size > 1
+            and self.tiered_moe_config.routing_trace_output is not None
+        ):
+            raise ValueError(
+                "Routing trace capture does not support DCP; capture traces "
+                "with DCP1 and apply the placement profile under DCP"
+            )
         if not parallel.enable_expert_parallel:
             raise ValueError("Tiered MoE requires expert parallelism")
         if not parallel.enable_ep_weight_filter:

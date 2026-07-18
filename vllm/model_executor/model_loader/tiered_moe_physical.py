@@ -165,6 +165,7 @@ def plan_tiered_moe_scenario(
     expert_placement: str,
     num_mtp_layers: int = 0,
     placement_profile: TieredMoEPlacementProfile | None = None,
+    dcp_world_size: int = 1,
 ) -> TieredMoEScenarioPlan:
     """Build one complete cache/expert physical scenario."""
     supplied_names = set(base_hbm_allocations) | set(base_host_allocations)
@@ -184,6 +185,7 @@ def plan_tiered_moe_scenario(
         kv_cache_dtype=kv_cache_dtype,
         main_cache_tier=cache_tier,
         num_mtp_layers=num_mtp_layers,
+        dcp_world_size=dcp_world_size,
     )
     fixed_hbm_allocations = dict(base_hbm_allocations)
     fixed_host_allocations = dict(base_host_allocations)
@@ -284,6 +286,7 @@ def build_tiered_moe_rank_load_plan(
         expert_placement=parallel.expert_placement_strategy,
         num_mtp_layers=num_mtp_layers,
         placement_profile=placement_profile,
+        dcp_world_size=parallel.decode_context_parallel_size,
     )
     if not 0 <= ep_rank < len(scenario.rank_plans):
         raise ValueError("EP rank is outside the physical plan")

@@ -153,6 +153,38 @@ def _even_layer_placement(
     return tuple(placements)
 
 
+def _promote_underfilled_residency(
+    hot_map: dict[int, tuple[int, ...]],
+    ownership_map: dict[int, tuple[int, ...]],
+    routed_layers: tuple[int, ...],
+    extra_slots: int,
+) -> dict[int, tuple[int, ...]]:
+    """Deterministically promote cold experts when HBM outgrows a profile.
+
+    A residency profile pins the trace-hot experts; when the physical budget
+    grows (for example DCP shrinks the KV cache), the remaining slots are
+    filled round-robin across layers in owned order rather than leaving HBM
+    idle. Ordering within the promoted set carries no frequency information.
+    """
+    promoted = {layer_id: list(hot_map[layer_id]) for layer_id in routed_layers}
+    remaining = extra_slots
+    while remaining > 0:
+        progressed = False
+        for layer_id in routed_layers:
+            if remaining == 0:
+                break
+            hot_set = set(promoted[layer_id])
+            for expert_id in ownership_map[layer_id]:
+                if expert_id not in hot_set:
+                    promoted[layer_id].append(expert_id)
+                    remaining -= 1
+                    progressed = True
+                    break
+        if not progressed:
+            raise ValueError("Residency promotion ran out of cold experts")
+    return {layer_id: tuple(ids) for layer_id, ids in promoted.items()}
+
+
 def build_layer_expert_ownership_map(
     manifest: TieredMoECheckpointManifest,
     ep_size: int,
@@ -285,8 +317,13 @@ def plan_rank_expert_tiers(
         hot_map = dict(hot_expert_ids_by_layer)
         if set(hot_map) != set(manifest.routed_layers):
             raise ValueError("Static residency map does not cover routed layers")
-        if sum(len(expert_ids) for expert_ids in hot_map.values()) != hot_slots:
-            raise ValueError("Static residency map does not fill the HBM expert budget")
+        map_slots = sum(len(expert_ids) for expert_ids in hot_map.values())
+        if map_slots > hot_slots:
+            raise ValueError("Static residency map exceeds the HBM expert budget")
+        if map_slots < hot_slots:
+            hot_map = _promote_underfilled_residency(
+                hot_map, ownership_map, manifest.routed_layers, hot_slots - map_slots
+            )
         placements = []
         for layer_id in manifest.routed_layers:
             owned = ownership_map[layer_id]

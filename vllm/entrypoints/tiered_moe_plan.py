@@ -119,6 +119,7 @@ def build_tiered_moe_plan(
     summary_only: bool,
     placement_profile_path: str | None = None,
     num_mtp_layers: int = 0,
+    dcp_world_size: int = 1,
 ) -> dict[str, Any]:
     """Build a fail-closed physical plan without reading model payloads."""
     start = time.perf_counter()
@@ -173,6 +174,7 @@ def build_tiered_moe_plan(
             expert_placement=expert_placement,
             num_mtp_layers=num_mtp_layers,
             placement_profile=placement_profile,
+            dcp_world_size=dcp_world_size,
         )
         plan_summaries = [plan.summary() for plan in scenario.rank_plans]
         if summary_only:
@@ -235,6 +237,7 @@ def build_tiered_moe_plan_from_vllm_config(vllm_config: Any) -> dict[str, Any]:
         summary_only=False,
         placement_profile_path=tiered.placement_profile,
         num_mtp_layers=num_mtp_layers,
+        dcp_world_size=parallel.decode_context_parallel_size,
     )
     result["machine_profile"] = profile.summary()
     return result

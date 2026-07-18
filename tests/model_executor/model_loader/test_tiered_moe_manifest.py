@@ -141,6 +141,7 @@ def test_host_uva_kv_plan_preserves_native_block_count_and_tiers():
         tiered_moe_config=SimpleNamespace(enabled=True, mla_cache_tier="host_uva"),
         model_config=SimpleNamespace(max_model_len=400_000),
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         kv_transfer_config=None,
     )
 
@@ -192,6 +193,7 @@ def test_hbm_kv_plan_preserves_semantic_main_and_indexer_counts():
         tiered_moe_config=SimpleNamespace(enabled=True, mla_cache_tier="hbm"),
         model_config=SimpleNamespace(max_model_len=400_000),
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         kv_transfer_config=None,
     )
 
@@ -397,6 +399,58 @@ def test_trace_placement_profile_drives_owner_and_residency(tmp_path):
     )
 
 
+def test_residency_profile_promotes_cold_when_hbm_budget_grows(tmp_path):
+    """A larger HBM budget (e.g. DCP shrinking the KV cache) must fill the
+    extra slots deterministically instead of failing or idling HBM."""
+    path = tmp_path / "placement.json"
+    write_placement_profile(path)
+    manifest = make_planner_manifest()
+    profile = load_tiered_moe_placement_profile(path, manifest, ep_size=2)
+
+    plan = plan_rank_expert_tiers(
+        manifest,
+        ep_size=2,
+        ep_rank=0,
+        hbm_capacity_bytes=750,
+        hbm_reserve_bytes=100,
+        fixed_hbm_allocations={"fixed": 300},
+        host_capacity_bytes=1000,
+        host_reserve_bytes=100,
+        minimum_hbm_reserve_bytes=0,
+        minimum_host_reserve_bytes=0,
+        owned_expert_ids_by_layer=profile.ownership_for_rank(0),
+        hot_expert_ids_by_layer=profile.hot_for_rank(0),
+    )
+
+    assert plan.layer_placements == (
+        LayerExpertPlacement(3, (0, 2), ()),
+        LayerExpertPlacement(4, (1,), (3,)),
+    )
+
+
+def test_residency_profile_rejects_overfilled_hbm_budget(tmp_path):
+    path = tmp_path / "placement.json"
+    write_placement_profile(path)
+    manifest = make_planner_manifest()
+    profile = load_tiered_moe_placement_profile(path, manifest, ep_size=2)
+
+    with pytest.raises(ValueError, match="exceeds the HBM expert budget"):
+        plan_rank_expert_tiers(
+            manifest,
+            ep_size=2,
+            ep_rank=0,
+            hbm_capacity_bytes=550,
+            hbm_reserve_bytes=100,
+            fixed_hbm_allocations={"fixed": 300},
+            host_capacity_bytes=1000,
+            host_reserve_bytes=100,
+            minimum_hbm_reserve_bytes=0,
+            minimum_host_reserve_bytes=0,
+            owned_expert_ids_by_layer=profile.ownership_for_rank(0),
+            hot_expert_ids_by_layer=profile.hot_for_rank(0),
+        )
+
+
 def test_trace_placement_profile_rejects_unbalanced_owner_row(tmp_path):
     path = tmp_path / "placement.json"
     write_placement_profile(path)
@@ -464,6 +518,38 @@ def test_glm_kv_plan_budgets_scheduler_null_block_for_400k():
     assert plan.indexer_cache_bytes == 1_108_977_408
     assert plan.hbm_bytes == 1_108_977_408
     assert plan.host_bytes == 20_470_474_752
+
+
+def test_glm_kv_plan_shards_blocks_across_dcp_group():
+    """DCP4 stores 1/4 of every sequence per rank: one 64-token physical
+    block per rank per 256-token logical block, plus the null block."""
+    plan = plan_glm_kv_cache(
+        make_glm_config(),
+        max_model_len=400_000,
+        block_size=64,
+        kv_cache_dtype="fp8_ds_mla",
+        main_cache_tier="hbm",
+        dcp_world_size=4,
+    )
+
+    assert plan.dcp_world_size == 4
+    assert plan.num_blocks == 1_564
+    assert plan.allocated_tokens == 100_096
+    assert (plan.num_blocks - 1) * plan.block_size * 4 >= 400_000
+    assert plan.main_cache_bytes == 1_564 * 41_984 * 78
+    assert plan.indexer_cache_bytes == 1_564 * 8_448 * 21
+
+
+def test_glm_kv_plan_rejects_non_positive_dcp():
+    with pytest.raises(ValueError, match="DCP world size"):
+        plan_glm_kv_cache(
+            make_glm_config(),
+            max_model_len=400_000,
+            block_size=64,
+            kv_cache_dtype="fp8_ds_mla",
+            main_cache_tier="hbm",
+            dcp_world_size=0,
+        )
 
 
 def test_glm_kv_plan_includes_grafted_mtp_cache():

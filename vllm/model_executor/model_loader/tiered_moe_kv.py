@@ -90,9 +90,11 @@ def get_tiered_kv_available_memory(
     if block_sizes != {_NATIVE_BLOCK_SIZE}:
         raise ValueError("Tiered GLM cache specs must use 64-token blocks")
     max_model_len = vllm_config.model_config.max_model_len
+    dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+    logical_block_tokens = _NATIVE_BLOCK_SIZE * dcp_world_size
     num_blocks = (
-        max_model_len + _NATIVE_BLOCK_SIZE - 1
-    ) // _NATIVE_BLOCK_SIZE + _SCHEDULER_NULL_BLOCKS
+        max_model_len + logical_block_tokens - 1
+    ) // logical_block_tokens + _SCHEDULER_NULL_BLOCKS
     bytes_per_block = sum(
         spec.page_size_bytes for spec in (*main_specs, *indexer_specs)
     )
@@ -107,6 +109,7 @@ class TieredKVCachePlan:
     block_size: int
     num_blocks: int
     allocated_tokens: int
+    dcp_world_size: int
     main_layer_count: int
     indexer_layer_ids: tuple[int, ...]
     main_page_bytes_per_layer: int
@@ -137,6 +140,7 @@ class TieredKVCachePlan:
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
             "allocated_tokens": self.allocated_tokens,
+            "dcp_world_size": self.dcp_world_size,
             "main_spec_kind": self.main_spec_kind,
             "main_cache_dtype": self.main_cache_dtype,
             "main_model_version": self.main_model_version,
@@ -168,6 +172,7 @@ def plan_glm_kv_cache(
     kv_cache_dtype: str,
     main_cache_tier: str,
     num_mtp_layers: int = 0,
+    dcp_world_size: int = 1,
 ) -> TieredKVCachePlan:
     """Build the exact native cache allocation without loading model tensors.
 
@@ -177,6 +182,9 @@ def plan_glm_kv_cache(
         block_size: Native cache block size selected by the platform.
         kv_cache_dtype: Requested main MLA cache dtype.
         main_cache_tier: Physical tier for the main MLA cache.
+        num_mtp_layers: Grafted MTP layers that also hold KV cache.
+        dcp_world_size: Decode-context-parallel size; tokens shard across the
+            DCP group so each rank stores 1/dcp of every sequence.
 
     Returns:
         Exact per-rank cache geometry and physical byte totals.
@@ -186,6 +194,8 @@ def plan_glm_kv_cache(
     """
     if max_model_len <= 0:
         raise ValueError("Maximum model length must be positive")
+    if dcp_world_size < 1:
+        raise ValueError("DCP world size must be positive")
     max_position_embeddings = config.get("max_position_embeddings")
     if not isinstance(max_position_embeddings, int):
         raise ValueError("GLM max_position_embeddings must be an integer")
@@ -248,12 +258,18 @@ def plan_glm_kv_cache(
     if len(indexer_layer_ids) != 21 + num_mtp_layers:
         raise ValueError("Pinned GLM indexer cache count is inconsistent")
 
-    num_blocks = (max_model_len + block_size - 1) // block_size + _SCHEDULER_NULL_BLOCKS
+    # The KV manager's logical block spans block_size * dcp tokens, one
+    # physical block per DCP rank (single_type_kv_cache_manager).
+    logical_block_tokens = block_size * dcp_world_size
+    num_blocks = (
+        max_model_len + logical_block_tokens - 1
+    ) // logical_block_tokens + _SCHEDULER_NULL_BLOCKS
     return TieredKVCachePlan(
         max_model_len=max_model_len,
         block_size=block_size,
         num_blocks=num_blocks,
         allocated_tokens=num_blocks * block_size,
+        dcp_world_size=dcp_world_size,
         main_layer_count=cache_layer_count,
         indexer_layer_ids=indexer_layer_ids,
         main_page_bytes_per_layer=main_spec.page_size_bytes,
@@ -273,6 +289,7 @@ def plan_glm_kv_cache_from_path(
     kv_cache_dtype: str,
     main_cache_tier: str,
     num_mtp_layers: int = 0,
+    dcp_world_size: int = 1,
 ) -> TieredKVCachePlan:
     """Read only config metadata and build the exact cache plan."""
     config_path = Path(model_path) / "config.json"
@@ -287,4 +304,5 @@ def plan_glm_kv_cache_from_path(
         kv_cache_dtype=kv_cache_dtype,
         main_cache_tier=main_cache_tier,
         num_mtp_layers=num_mtp_layers,
+        dcp_world_size=dcp_world_size,
     )
