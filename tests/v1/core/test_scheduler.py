@@ -27,7 +27,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, _routed_expert_route_count
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -41,6 +41,14 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_routed_expert_trace_can_include_rejected_spec_tokens():
+    request = Mock(sampling_params=SamplingParams())
+    assert _routed_expert_route_count(request, 4, 2) == 2
+
+    request.sampling_params.extra_args = {"return_rejected_routed_experts": True}
+    assert _routed_expert_route_count(request, 4, 2) == 4
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

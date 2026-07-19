@@ -67,6 +67,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _routed_expert_route_count(
+    request: Request, num_tokens_scheduled: int, num_new_tokens: int
+) -> int:
+    sampling_params = request.sampling_params
+    include_rejected = bool(
+        sampling_params is not None
+        and sampling_params.extra_args
+        and sampling_params.extra_args.get("return_rejected_routed_experts")
+    )
+    return num_tokens_scheduled if include_rejected else num_new_tokens
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1780,8 +1792,11 @@ class Scheduler(SchedulerInterface):
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
                         # the scheduled range, rejected at the end.
+                        route_count = _routed_expert_route_count(
+                            request, num_tokens_scheduled, len(new_token_ids)
+                        )
                         routed_experts = routing_data[
-                            req_offset : req_offset + len(new_token_ids)
+                            req_offset : req_offset + route_count
                         ]
                     else:
                         # Normal decode / re-prefill: token(s) at the END.
