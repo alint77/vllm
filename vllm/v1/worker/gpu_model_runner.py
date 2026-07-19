@@ -6573,7 +6573,10 @@ class GPUModelRunner(
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
-        if self.parallel_config.decode_context_parallel_size > 1:
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            and self.vllm_config.tiered_moe_config.enabled
+        ):
             # FULL-graph profiling capture (temporary pool + minimal KV cache)
             # hard-crashes when the graph contains DCP collectives; the real
             # capture_model pass with the persistent pool and final KV cache

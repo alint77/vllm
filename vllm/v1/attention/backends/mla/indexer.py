@@ -431,6 +431,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native and max_decode_len > 1:
             assert self.decode_seq_lens_buffer.dim() == 1
+            # The scheduler retains the global logical block-table width under
+            # DCP, while the indexer addresses only this rank's local blocks.
+            block_table = block_table[:, : self.expanded_block_table_buffer.shape[1]]
             if min_decode_len == max_decode_len:
                 # Uniform decode lengths.
                 num_decode_tokens = num_decodes * max_decode_len

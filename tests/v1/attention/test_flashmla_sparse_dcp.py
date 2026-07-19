@@ -12,6 +12,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.flashmla_sparse import mask_empty_dcp_lse
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
@@ -32,6 +33,46 @@ if not current_platform.is_cuda():
     pytest.skip("FlashMLA sparse requires CUDA", allow_module_level=True)
 if not is_flashmla_sparse_supported()[0]:
     pytest.skip("FlashMLA sparse kernels unavailable", allow_module_level=True)
+
+
+def test_dcp_variable_decode_expands_local_block_table():
+    """Variable MTP lengths copy only the DCP-local block-table prefix."""
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.decode_seq_lens_buffer = torch.zeros(16, dtype=torch.int32)
+    builder.expanded_block_table_buffer = torch.zeros((16, 3), dtype=torch.int32)
+    builder.decode_lens_buffer = torch.zeros(16, dtype=torch.int32)
+    builder.arange_buffer = torch.arange(16, dtype=torch.int32)
+
+    block_table = torch.arange(16, dtype=torch.int32).view(2, 8)
+    decode_lens = torch.tensor([3, 1], dtype=torch.int32)
+    seq_lens, expanded, lens, batch_size, requires_padding = (
+        builder._prepare_decode_tensors(
+            seq_lens=torch.tensor([12, 9], dtype=torch.int32),
+            block_table=block_table,
+            decode_lens=decode_lens,
+            decode_lens_cpu=decode_lens,
+            query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+            num_decodes=2,
+            num_decode_tokens=4,
+            use_native=False,
+            next_n=4,
+            max_decode_len=3,
+        )
+    )
+
+    assert batch_size == 4
+    assert not requires_padding
+    torch.testing.assert_close(
+        seq_lens, torch.tensor([10, 11, 12, 9], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        expanded,
+        torch.tensor(
+            [[0, 1, 2], [0, 1, 2], [0, 1, 2], [8, 9, 10]],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(lens, torch.ones(4, dtype=torch.int32))
 
 
 def _pack_fp8_ds_mla_cache(kv_c: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
