@@ -11,7 +11,11 @@ import torch.multiprocessing as mp
 
 import vllm.envs as envs
 from tests.utils import ensure_current_vllm_config
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.distributed.device_communicators.all_reduce_utils import (
+    should_nccl_symm_mem_allreduce,
+)
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.device_communicators.pynccl import register_nccl_symmetric_ops
 from vllm.distributed.device_communicators.pynccl_allocator import (
@@ -30,6 +34,25 @@ torch.manual_seed(42)
 random.seed(44)
 
 test_size_elements = 4 * 1024 * 1024
+
+
+def test_nccl_symm_mem_allreduce_disabled_for_dcp(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.pynccl_allocator."
+        "is_symmetric_memory_enabled",
+        lambda: True,
+    )
+    input_tensor = torch.empty(1)
+    tp4 = ParallelConfig(tensor_parallel_size=4)
+    dcp4 = ParallelConfig(
+        tensor_parallel_size=4,
+        decode_context_parallel_size=4,
+    )
+
+    with set_current_vllm_config(VllmConfig(parallel_config=tp4)):
+        assert should_nccl_symm_mem_allreduce(4, input_tensor)
+    with set_current_vllm_config(VllmConfig(parallel_config=dcp4)):
+        assert not should_nccl_symm_mem_allreduce(4, input_tensor)
 
 
 def nccl_symm_mem_allreduce_worker(local_rank: int, world_size: int):

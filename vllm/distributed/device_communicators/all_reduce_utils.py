@@ -115,6 +115,12 @@ def should_nccl_symm_mem_allreduce(world_size: int, input_tensor: torch.Tensor) 
     if envs.VLLM_BATCH_INVARIANT:
         return False
 
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is not None and config.parallel_config.decode_context_parallel_size > 1:
+        return False
+
     if not is_symmetric_memory_enabled():
         return False
 
