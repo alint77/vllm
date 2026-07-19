@@ -3,10 +3,12 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
@@ -80,3 +82,45 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+def test_build_draft_attn_metadata_updates_dcp_lengths(monkeypatch):
+    speculator = object.__new__(_TestSpeculator)
+    speculator.arange = torch.arange(5, dtype=torch.int32)
+    speculator.input_buffers = SimpleNamespace(
+        query_start_loc=torch.zeros(5, dtype=torch.int32),
+        seq_lens=torch.tensor([17, 18, 19, 0], dtype=torch.int32),
+        dcp_local_seq_lens=torch.zeros(4, dtype=torch.int32),
+    )
+    speculator.block_tables = SimpleNamespace(
+        cp_size=4,
+        cp_rank=2,
+        cp_interleave=1,
+        input_block_tables=[torch.zeros((4, 2), dtype=torch.int32)],
+        slot_mappings=torch.zeros((1, 4), dtype=torch.int64),
+    )
+    speculator.attn_groups = []
+    speculator.kv_cache_config = SimpleNamespace()
+    speculator.draft_max_seq_len = 19
+    prepare_dcp_lengths = Mock()
+    build_attn_metadata = Mock(return_value={})
+    monkeypatch.setattr(
+        base_spec_module, "prepare_dcp_local_seq_lens", prepare_dcp_lengths
+    )
+    monkeypatch.setattr(base_spec_module, "build_attn_metadata", build_attn_metadata)
+
+    speculator._build_draft_attn_metadata(3, 4, 4)
+
+    prepare_dcp_lengths.assert_called_once_with(
+        speculator.input_buffers.dcp_local_seq_lens,
+        speculator.input_buffers.seq_lens,
+        3,
+        4,
+        2,
+        1,
+    )
+    dcp_lengths = build_attn_metadata.call_args.kwargs["dcp_local_seq_lens"]
+    assert (
+        dcp_lengths.data_ptr() == speculator.input_buffers.dcp_local_seq_lens.data_ptr()
+    )
+    assert dcp_lengths.shape == (4,)

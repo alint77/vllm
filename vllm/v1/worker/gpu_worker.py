@@ -429,7 +429,15 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
-        self.model_runner.init_dsa_index_trace_capturer()
+        init_dsa_trace = getattr(
+            self.model_runner, "init_dsa_index_trace_capturer", None
+        )
+        if init_dsa_trace is not None:
+            init_dsa_trace()
+        elif envs.VLLM_DSA_INDEX_TRACE_DIR:
+            raise NotImplementedError(
+                "DSA index tracing is not supported by the V2 model runner"
+            )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

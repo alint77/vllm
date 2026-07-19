@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -20,6 +21,25 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_load_model_allows_runner_without_dsa_trace_hook(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = SimpleNamespace(load_model=Mock())
+    worker = object.__new__(Worker)
+    worker.model_runner = runner
+    worker.vllm_config = SimpleNamespace(weight_transfer_config=None)
+    worker._maybe_get_memory_pool_context = lambda **kwargs: nullcontext()
+    worker._scoped_allocator_max_split = lambda **kwargs: nullcontext()
+    monkeypatch.delenv("VLLM_DSA_INDEX_TRACE_DIR", raising=False)
+    monkeypatch.setattr(
+        gpu_worker_module, "set_current_vllm_config", lambda config: nullcontext()
+    )
+
+    worker.load_model()
+
+    runner.load_model.assert_called_once_with(load_dummy_weights=False)
 
 
 def _worker_with_mm_config(
