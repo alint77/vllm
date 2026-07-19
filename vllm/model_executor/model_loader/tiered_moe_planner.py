@@ -5,6 +5,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from vllm import envs
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
@@ -324,6 +325,9 @@ def plan_rank_expert_tiers(
     owned_expert_ids = next(iter(ownership_map.values()))
     total_slots = sum(len(expert_ids) for expert_ids in ownership_map.values())
     hot_slots = min(total_slots, available_hbm // manifest.runtime_expert_bytes)
+    if hot_expert_ids_by_layer is not None and envs.VLLM_TIERED_MOE_PROFILE_CAP:
+        profile_slots = sum(len(ids) for ids in hot_expert_ids_by_layer.values())
+        hot_slots = min(hot_slots, profile_slots)
     cold_slots = total_slots - hot_slots
     hot_expert_bytes = hot_slots * manifest.runtime_expert_bytes
     cold_expert_bytes = cold_slots * manifest.runtime_expert_bytes

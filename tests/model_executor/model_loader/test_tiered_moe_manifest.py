@@ -430,6 +430,34 @@ def test_residency_profile_promotes_cold_when_hbm_budget_grows(tmp_path):
     )
 
 
+def test_residency_profile_cap_leaves_extra_hbm_free(tmp_path, monkeypatch):
+    path = tmp_path / "placement.json"
+    write_placement_profile(path)
+    manifest = make_planner_manifest()
+    profile = load_tiered_moe_placement_profile(path, manifest, ep_size=2)
+    monkeypatch.setenv("VLLM_TIERED_MOE_PROFILE_CAP", "1")
+
+    plan = plan_rank_expert_tiers(
+        manifest,
+        ep_size=2,
+        ep_rank=0,
+        hbm_capacity_bytes=750,
+        hbm_reserve_bytes=100,
+        fixed_hbm_allocations={"fixed": 300},
+        host_capacity_bytes=1000,
+        host_reserve_bytes=100,
+        minimum_hbm_reserve_bytes=0,
+        minimum_host_reserve_bytes=0,
+        owned_expert_ids_by_layer=profile.ownership_for_rank(0),
+        hot_expert_ids_by_layer=profile.hot_for_rank(0),
+    )
+
+    assert plan.layer_placements == (
+        LayerExpertPlacement(3, (2,), (0,)),
+        LayerExpertPlacement(4, (1,), (3,)),
+    )
+
+
 def test_residency_profile_demotes_hot_when_hbm_budget_shrinks(tmp_path):
     """A smaller HBM budget (e.g. concurrent-sequence KV growth) trims hot
     experts deterministically instead of failing."""
