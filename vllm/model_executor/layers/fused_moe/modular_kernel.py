@@ -1598,6 +1598,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        overlap_max_tokens: int = 4,
     ) -> torch.Tensor:
         """Run disjoint expert tiers behind one prepare/finalize pair."""
         if not tiers:
@@ -1620,7 +1621,11 @@ class FusedMoEKernelModularImpl:
         )
 
         num_tokens = hidden_states.shape[0]
-        tier_stream = aux_stream() if len(tiers) == 2 and num_tokens <= 4 else None
+        tier_stream = (
+            aux_stream()
+            if len(tiers) == 2 and num_tokens <= overlap_max_tokens
+            else None
+        )
         if tier_stream is not None:
             buffers = self._allocate_tiered_buffers(
                 hidden_states.dtype,
@@ -1928,6 +1933,7 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        overlap_max_tokens: int = 4,
     ) -> torch.Tensor:
         """Run disjoint expert tiers behind one prepare/finalize pair."""
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
@@ -1942,4 +1948,5 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            overlap_max_tokens=overlap_max_tokens,
         )

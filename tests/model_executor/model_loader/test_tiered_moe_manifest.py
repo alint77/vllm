@@ -142,6 +142,7 @@ def test_host_uva_kv_plan_preserves_native_block_count_and_tiers():
         model_config=SimpleNamespace(max_model_len=400_000),
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
         kv_transfer_config=None,
     )
 
@@ -194,6 +195,7 @@ def test_hbm_kv_plan_preserves_semantic_main_and_indexer_counts():
         model_config=SimpleNamespace(max_model_len=400_000),
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
         kv_transfer_config=None,
     )
 
@@ -428,27 +430,33 @@ def test_residency_profile_promotes_cold_when_hbm_budget_grows(tmp_path):
     )
 
 
-def test_residency_profile_rejects_overfilled_hbm_budget(tmp_path):
+def test_residency_profile_demotes_hot_when_hbm_budget_shrinks(tmp_path):
+    """A smaller HBM budget (e.g. concurrent-sequence KV growth) trims hot
+    experts deterministically instead of failing."""
     path = tmp_path / "placement.json"
     write_placement_profile(path)
     manifest = make_planner_manifest()
     profile = load_tiered_moe_placement_profile(path, manifest, ep_size=2)
 
-    with pytest.raises(ValueError, match="exceeds the HBM expert budget"):
-        plan_rank_expert_tiers(
-            manifest,
-            ep_size=2,
-            ep_rank=0,
-            hbm_capacity_bytes=550,
-            hbm_reserve_bytes=100,
-            fixed_hbm_allocations={"fixed": 300},
-            host_capacity_bytes=1000,
-            host_reserve_bytes=100,
-            minimum_hbm_reserve_bytes=0,
-            minimum_host_reserve_bytes=0,
-            owned_expert_ids_by_layer=profile.ownership_for_rank(0),
-            hot_expert_ids_by_layer=profile.hot_for_rank(0),
-        )
+    plan = plan_rank_expert_tiers(
+        manifest,
+        ep_size=2,
+        ep_rank=0,
+        hbm_capacity_bytes=550,
+        hbm_reserve_bytes=100,
+        fixed_hbm_allocations={"fixed": 300},
+        host_capacity_bytes=1000,
+        host_reserve_bytes=100,
+        minimum_hbm_reserve_bytes=0,
+        minimum_host_reserve_bytes=0,
+        owned_expert_ids_by_layer=profile.ownership_for_rank(0),
+        hot_expert_ids_by_layer=profile.hot_for_rank(0),
+    )
+
+    assert plan.layer_placements == (
+        LayerExpertPlacement(3, (), (0, 2)),
+        LayerExpertPlacement(4, (1,), (3,)),
+    )
 
 
 def test_trace_placement_profile_rejects_unbalanced_owner_row(tmp_path):
@@ -538,6 +546,23 @@ def test_glm_kv_plan_shards_blocks_across_dcp_group():
     assert (plan.num_blocks - 1) * plan.block_size * 4 >= 400_000
     assert plan.main_cache_bytes == 1_564 * 41_984 * 78
     assert plan.indexer_cache_bytes == 1_564 * 8_448 * 21
+
+
+def test_glm_kv_plan_provisions_concurrent_sequences_under_dcp():
+    """c=4 x 400K with DCP4 must land at the same per-rank footprint as
+    c=1 x 400K without DCP (one full-length shard run per sequence)."""
+    plan = plan_glm_kv_cache(
+        make_glm_config(),
+        max_model_len=400_000,
+        block_size=64,
+        kv_cache_dtype="fp8_ds_mla",
+        main_cache_tier="hbm",
+        dcp_world_size=4,
+        max_num_seqs=4,
+    )
+
+    assert plan.num_blocks == 4 * 1_563 + 1
+    assert plan.main_cache_bytes == (4 * 1_563 + 1) * 41_984 * 78
 
 
 def test_glm_kv_plan_rejects_non_positive_dcp():

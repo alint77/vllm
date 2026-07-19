@@ -490,6 +490,18 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(layer, "tiered_moe_storage"):
             self.tiered_moe_kernels = []
+            # Hot/cold overlap covers every uniform spec-decode verify batch:
+            # (num_speculative_tokens + 1) * max_num_seqs tokens.
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+            speculative = vllm_config.speculative_config
+            verify_tokens = (
+                speculative.num_speculative_tokens + 1 if speculative is not None else 1
+            )
+            self.tiered_overlap_max_tokens = (
+                verify_tokens * vllm_config.scheduler_config.max_num_seqs
+            )
             assert self.experts_cls is not None
             owned_expert_ids = (
                 layer.tiered_moe_placement.hot_expert_ids
@@ -740,6 +752,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,
+                overlap_max_tokens=getattr(self, "tiered_overlap_max_tokens", 4),
             )
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

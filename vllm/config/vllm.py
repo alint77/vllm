@@ -2298,8 +2298,16 @@ class VllmConfig:
             raise ValueError("Tiered MoE does not support EPLB")
         if not parallel.numa_bind:
             raise ValueError("Tiered MoE requires NUMA binding")
-        if self.scheduler_config.max_num_seqs != 1:
-            raise ValueError("Tiered MoE initially requires max_num_seqs=1")
+        if not 1 <= self.scheduler_config.max_num_seqs <= 4:
+            raise ValueError("Tiered MoE supports max_num_seqs 1 through 4")
+        if (
+            self.scheduler_config.max_num_seqs > 1
+            and parallel.decode_context_parallel_size == 1
+        ):
+            raise ValueError(
+                "Tiered MoE max_num_seqs > 1 requires DCP (the replicated "
+                "400K MLA cache does not fit more than one sequence per rank)"
+            )
         if self.scheduler_config.max_num_batched_tokens != 8192:
             raise ValueError(
                 "Tiered MoE initially requires max_num_batched_tokens=8192"

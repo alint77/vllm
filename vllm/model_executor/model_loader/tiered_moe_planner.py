@@ -185,6 +185,33 @@ def _promote_underfilled_residency(
     return {layer_id: tuple(ids) for layer_id, ids in promoted.items()}
 
 
+def _demote_overfilled_residency(
+    hot_map: dict[int, tuple[int, ...]],
+    routed_layers: tuple[int, ...],
+    excess_slots: int,
+) -> dict[int, tuple[int, ...]]:
+    """Deterministically demote hot experts when HBM shrinks below a profile.
+
+    The inverse of promotion (e.g. concurrent-sequence KV growth under DCP):
+    trim one trailing hot expert per layer round-robin. Trailing order carries
+    no frequency information, matching promotion's neutrality.
+    """
+    demoted = {layer_id: list(hot_map[layer_id]) for layer_id in routed_layers}
+    remaining = excess_slots
+    while remaining > 0:
+        progressed = False
+        for layer_id in routed_layers:
+            if remaining == 0:
+                break
+            if demoted[layer_id]:
+                demoted[layer_id].pop()
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            raise ValueError("Residency demotion ran out of hot experts")
+    return {layer_id: tuple(ids) for layer_id, ids in demoted.items()}
+
+
 def build_layer_expert_ownership_map(
     manifest: TieredMoECheckpointManifest,
     ep_size: int,
@@ -319,8 +346,10 @@ def plan_rank_expert_tiers(
             raise ValueError("Static residency map does not cover routed layers")
         map_slots = sum(len(expert_ids) for expert_ids in hot_map.values())
         if map_slots > hot_slots:
-            raise ValueError("Static residency map exceeds the HBM expert budget")
-        if map_slots < hot_slots:
+            hot_map = _demote_overfilled_residency(
+                hot_map, manifest.routed_layers, map_slots - hot_slots
+            )
+        elif map_slots < hot_slots:
             hot_map = _promote_underfilled_residency(
                 hot_map, ownership_map, manifest.routed_layers, hot_slots - map_slots
             )
