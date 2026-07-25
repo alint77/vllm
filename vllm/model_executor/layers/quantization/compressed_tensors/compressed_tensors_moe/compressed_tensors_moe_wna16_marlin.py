@@ -489,84 +489,13 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(layer, "tiered_moe_storage"):
-            self.tiered_moe_kernels = []
-            # Hot/cold overlap covers every uniform spec-decode verify batch:
-            # (num_speculative_tokens + 1) * max_num_seqs tokens.
-            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.model_loader.tiered_moe_execution import (
+                setup_tiered_moe_kernels,
+            )
 
-            vllm_config = get_current_vllm_config()
-            speculative = vllm_config.speculative_config
-            verify_tokens = (
-                speculative.num_speculative_tokens + 1 if speculative is not None else 1
+            setup_tiered_moe_kernels(
+                self, layer, group_size=self.group_size, num_bits=self.num_bits
             )
-            self.tiered_overlap_max_tokens = (
-                verify_tokens * vllm_config.scheduler_config.max_num_seqs
-            )
-            assert self.experts_cls is not None
-            owned_expert_ids = (
-                layer.tiered_moe_placement.hot_expert_ids
-                + layer.tiered_moe_placement.cold_expert_ids
-            )
-            expert_map = torch.full(
-                (layer.global_num_experts,),
-                -1,
-                dtype=torch.int32,
-                device=layer.tiered_moe_storage.hot.buffer.device
-                if layer.tiered_moe_storage.hot is not None
-                else layer.tiered_moe_storage.cold.buffer.device,
-            )
-            expert_map[
-                torch.tensor(
-                    owned_expert_ids, dtype=torch.long, device=expert_map.device
-                )
-            ] = torch.arange(
-                len(owned_expert_ids), dtype=torch.int32, device=expert_map.device
-            )
-            layer._buffers["_expert_map"] = expert_map
-            for tier_name in ("hot", "cold"):
-                tier = getattr(layer.tiered_moe_storage, tier_name)
-                if tier is None:
-                    continue
-                components = tier.components
-                quant_config = make_wna16_moe_quant_config(
-                    w1_scale=components["w13_weight_scale"],
-                    w2_scale=components["w2_weight_scale"],
-                    group_size=self.group_size,
-                    num_bits=self.num_bits,
-                    gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
-                    gemm1_alpha=getattr(layer, "swiglu_alpha", None),
-                    gemm1_beta=getattr(layer, "swiglu_beta", None),
-                )
-                expert_map = torch.full(
-                    (layer.global_num_experts,),
-                    -1,
-                    dtype=torch.int32,
-                    device=tier.buffer.device,
-                )
-                expert_map[
-                    torch.tensor(
-                        tier.expert_ids,
-                        dtype=torch.long,
-                        device=tier.buffer.device,
-                    )
-                ] = torch.arange(
-                    len(tier.expert_ids),
-                    dtype=torch.int32,
-                    device=tier.buffer.device,
-                )
-                layer.register_buffer(f"tiered_{tier_name}_expert_map", expert_map)
-                kernel = make_wna16_moe_kernel(
-                    moe_quant_config=quant_config,
-                    moe_config=self.moe,
-                    experts_cls=self.experts_cls,
-                    routing_tables=None,
-                    is_k_full=self.is_k_full,
-                )
-                self.tiered_moe_kernels.append((kernel, components, expert_map))
-                if len(self.tiered_moe_kernels) == 1:
-                    self.moe_quant_config = quant_config
-                    self.moe_kernel = kernel
-            layer.tiered_moe_load_complete = True
             return
         # Process weights using the shared oracle infrastructure
         is_flashinfer = self.wna16_backend == WNA16MoEBackend.FLASHINFER_TRTLLM
@@ -731,28 +660,18 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         if hasattr(self, "tiered_moe_kernels"):
-            primary_kernel = self.tiered_moe_kernels[0][0]
-            tiers = [
-                (
-                    kernel,
-                    components["w13_weight_packed"],
-                    components["w2_weight_packed"],
-                    expert_map,
-                )
-                for kernel, components, expert_map in self.tiered_moe_kernels
-            ]
-            return primary_kernel.apply_tiered(
+            from vllm.model_executor.model_loader.tiered_moe_execution import (
+                apply_tiered_moe,
+            )
+
+            return apply_tiered_moe(
+                self,
+                layer,
                 x,
-                tiers,
                 topk_weights,
                 topk_ids,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                prepare_expert_map=layer.expert_map,
-                apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                shared_experts=shared_experts,
-                shared_experts_input=shared_experts_input,
-                overlap_max_tokens=getattr(self, "tiered_overlap_max_tokens", 4),
+                shared_experts,
+                shared_experts_input,
             )
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

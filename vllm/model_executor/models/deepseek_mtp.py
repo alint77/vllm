@@ -116,8 +116,14 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         else:
             topk_indices_buffer = None
 
+        checkpoint_quant = getattr(config, "quantization_config", {}) or {}
+        shared_head_quant = (
+            None
+            if checkpoint_quant.get("quant_method") == "auto-round"
+            else quant_config
+        )
         self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
+            config=config, prefix=prefix, quant_config=shared_head_quant
         )
         self.mtp_block = DeepseekV2DecoderLayer(
             vllm_config,

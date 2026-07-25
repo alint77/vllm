@@ -91,7 +91,9 @@ def get_moe_quant_method(
         # Dynamic per module/layer rules may override base config
         override_config(cloned_config, prefix=prefix)
 
-    return moe_method_cls(cloned_config, layer.moe_config)
+    method = moe_method_cls(cloned_config, layer.moe_config)
+    method.layer_name = prefix
+    return method
 
 
 class AutoGPTQConfig(QuantizationConfig):
@@ -474,6 +476,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe)
         self.quant_config = quant_config
+        self.layer_name: str | None = None
         if self.quant_config.quant_type.size_bits == 4:
             quant_type = scalar_types.uint4b8
             scale = kInt4StaticGroupScale
@@ -532,6 +535,74 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         layer.num_groups_w2 = scales_size2
 
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
+        from vllm.model_executor.model_loader.tiered_moe_physical import (
+            get_tiered_moe_rank_load_plan,
+            resolve_layer_expert_placement,
+        )
+
+        tiered_plan = get_tiered_moe_rank_load_plan()
+        if tiered_plan is not None:
+            placement = resolve_layer_expert_placement(tiered_plan, self.layer_name)
+            planned_experts = len(placement.hot_expert_ids) + len(
+                placement.cold_expert_ids
+            )
+            if num_experts != planned_experts:
+                raise ValueError(
+                    f"Tiered layer {placement.layer_id} plans {planned_experts} "
+                    f"experts but native construction requested {num_experts}"
+                )
+            if (
+                self.wna16_moe_backend != WNA16MoEBackend.MARLIN
+                or hidden_size != 6144
+                or intermediate_size_per_partition != 2048
+                or params_dtype != torch.bfloat16
+                or self.quant_config.weight_bits != 4
+                or self.quant_config.group_size != 64
+                or self.quant_config.desc_act
+                or not self.quant_config.is_sym
+                or tiered_plan.manifest.group_size != self.quant_config.group_size
+            ):
+                raise ValueError(
+                    "Tiered AutoRound GLM construction does not match W4G64"
+                )
+
+            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.model_loader.tiered_moe_storage import (
+                allocate_layer_expert_storage,
+            )
+            from vllm.utils.numa_utils import _get_numa_node
+
+            layer.tiered_moe_placement = placement
+            device_index = torch.accelerator.current_device_index()
+            parallel_config = get_current_vllm_config().parallel_config
+            numa_node = _get_numa_node(parallel_config, device_index)
+            layer.tiered_moe_storage = allocate_layer_expert_storage(
+                placement,
+                device_index,
+                numa_node,
+                group_size=self.quant_config.group_size,
+            )
+            placeholder_types = {
+                "w13_qweight": torch.int32,
+                "w2_qweight": torch.int32,
+                "w13_scales": params_dtype,
+                "w2_scales": params_dtype,
+                "w13_qzeros": torch.int32,
+                "w2_qzeros": torch.int32,
+                "w13_g_idx": torch.int32,
+                "w2_g_idx": torch.int32,
+                "w13_g_idx_sort_indices": torch.int32,
+                "w2_g_idx_sort_indices": torch.int32,
+            }
+            for name, dtype in placeholder_types.items():
+                parameter = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype), requires_grad=False
+                )
+                layer.register_parameter(name, parameter)
+                set_weight_attrs(parameter, extra_weight_attrs)
+            self.is_k_full = True
+            return
+
         # Fused gate_up_proj (column parallel)
         w13_qweight = torch.nn.Parameter(
             torch.empty(
@@ -651,6 +722,19 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             layer.workspace = marlin_make_workspace_new(device, 4)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if hasattr(layer, "tiered_moe_storage"):
+            from vllm.model_executor.model_loader.tiered_moe_execution import (
+                setup_tiered_moe_kernels,
+            )
+
+            setup_tiered_moe_kernels(
+                self,
+                layer,
+                group_size=self.quant_config.group_size,
+                num_bits=self.quant_config.weight_bits,
+            )
+            return
+
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
 
         if is_a_8bit:
@@ -812,6 +896,20 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
+        if hasattr(self, "tiered_moe_kernels"):
+            from vllm.model_executor.model_loader.tiered_moe_execution import (
+                apply_tiered_moe,
+            )
+
+            return apply_tiered_moe(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+            )
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             hidden_states=x,

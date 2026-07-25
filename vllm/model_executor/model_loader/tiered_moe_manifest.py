@@ -22,8 +22,10 @@ _CONFIG_FILE = "config.json"
 _EXPERT_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
     r"(gate_proj|up_proj|down_proj)\."
-    r"(weight_packed|weight_scale|weight_shape)$"
+    r"(weight_packed|weight_scale|weight_shape|qweight|qzeros|scales)$"
 )
+_COMPRESSED_TENSORS = "compressed_tensors"
+_AUTO_ROUND_GPTQ = "auto_round_gptq"
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -79,6 +81,8 @@ class TieredMoECheckpointManifest:
     checkpoint_expert_bytes: int
     runtime_expert_bytes: int
     runtime_expert_format: str = "vllm_marlin_static_w4a16"
+    checkpoint_expert_format: str = _COMPRESSED_TENSORS
+    group_size: int = 128
 
     def rank_checkpoint_expert_bytes(
         self,
@@ -123,6 +127,8 @@ class TieredMoECheckpointManifest:
             "checkpoint_expert_bytes": self.checkpoint_expert_bytes,
             "runtime_expert_bytes": self.runtime_expert_bytes,
             "runtime_expert_format": self.runtime_expert_format,
+            "checkpoint_expert_format": self.checkpoint_expert_format,
+            "group_size": self.group_size,
         }
         if ep_size is not None:
             result["ep_size"] = ep_size
@@ -162,7 +168,9 @@ def _require_equal(actual: Any, expected: Any, field: str) -> None:
         )
 
 
-def _validate_glm_w4a16_config(config: dict[str, Any]) -> tuple[int, ...]:
+def _validate_glm_w4a16_config(
+    config: dict[str, Any],
+) -> tuple[tuple[int, ...], str, int]:
     _require_equal(
         config.get("architectures"), ["GlmMoeDsaForCausalLM"], "architecture"
     )
@@ -179,23 +187,38 @@ def _validate_glm_w4a16_config(config: dict[str, Any]) -> tuple[int, ...]:
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict):
         raise ValueError("GLM W4A16 quantization_config is missing")
-    _require_equal(
-        quantization.get("quant_method"), "compressed-tensors", "quant method"
-    )
-    _require_equal(quantization.get("format"), "pack-quantized", "quant format")
-    group = quantization.get("config_groups", {}).get("group_0", {})
-    weights = group.get("weights", {})
-    required_weights = {
-        "actorder": "static",
-        "group_size": 128,
-        "num_bits": 4,
-        "strategy": "group",
-        "symmetric": True,
-        "type": "int",
-    }
-    for field, expected in required_weights.items():
-        _require_equal(weights.get(field), expected, f"weight {field}")
-    return tuple(range(3, 78))
+    quant_method = quantization.get("quant_method")
+    if quant_method == "compressed-tensors":
+        _require_equal(quantization.get("format"), "pack-quantized", "quant format")
+        group = quantization.get("config_groups", {}).get("group_0", {})
+        weights = group.get("weights", {})
+        required_weights = {
+            "actorder": "static",
+            "group_size": 128,
+            "num_bits": 4,
+            "strategy": "group",
+            "symmetric": True,
+            "type": "int",
+        }
+        for field, expected in required_weights.items():
+            _require_equal(weights.get(field), expected, f"weight {field}")
+        checkpoint_format = _COMPRESSED_TENSORS
+        group_size = 128
+    elif quant_method == "auto-round":
+        required_quantization = {
+            "bits": 4,
+            "data_type": "int",
+            "group_size": 64,
+            "packing_format": "auto_round:auto_gptq",
+            "sym": True,
+        }
+        for field, expected in required_quantization.items():
+            _require_equal(quantization.get(field), expected, f"weight {field}")
+        checkpoint_format = _AUTO_ROUND_GPTQ
+        group_size = 64
+    else:
+        raise ValueError(f"Unsupported GLM W4A16 quant method: {quant_method!r}")
+    return tuple(range(3, 78)), checkpoint_format, group_size
 
 
 def _tensor_num_bytes(dtype: str, shape: tuple[int, ...]) -> int:
@@ -222,7 +245,12 @@ def _make_entry(
     if match is not None:
         layer, expert, projection, component = match.groups()
         layer_id = int(layer)
-        expert_id = int(expert)
+        if 3 <= layer_id < 78:
+            expert_id = int(expert)
+        else:
+            layer_id = None
+            projection = None
+            component = None
     return TensorManifestEntry(
         name=name,
         shard=shard,
@@ -240,12 +268,19 @@ def _validate_expert_entries(
     entries: tuple[TensorManifestEntry, ...],
     routed_layers: tuple[int, ...],
     num_experts: int,
+    checkpoint_format: str,
 ) -> tuple[int, int]:
     expert_entries = [entry for entry in entries if entry.is_routed_expert]
+    if checkpoint_format == _COMPRESSED_TENSORS:
+        component_names = ("weight_packed", "weight_scale", "weight_shape")
+    elif checkpoint_format == _AUTO_ROUND_GPTQ:
+        component_names = ("qweight", "qzeros", "scales")
+    else:
+        raise ValueError(f"Unsupported checkpoint expert format: {checkpoint_format}")
     expected_components = {
         (projection, component)
         for projection in ("gate_proj", "up_proj", "down_proj")
-        for component in ("weight_packed", "weight_scale", "weight_shape")
+        for component in component_names
     }
     grouped: dict[tuple[int, int], list[TensorManifestEntry]] = defaultdict(list)
     for entry in expert_entries:
@@ -265,7 +300,7 @@ def _validate_expert_entries(
         )
 
     expert_sizes = set()
-    expert_shape_sizes = set()
+    excluded_runtime_sizes = set()
     for key, components in grouped.items():
         actual_components = {
             (entry.projection, entry.component) for entry in components
@@ -273,21 +308,31 @@ def _validate_expert_entries(
         if actual_components != expected_components:
             raise ValueError(f"Incomplete routed expert components for {key}")
         expert_sizes.add(sum(entry.num_bytes for entry in components))
-        expert_shape_sizes.add(
+        excluded_runtime_sizes.add(
             sum(
                 entry.num_bytes
                 for entry in components
-                if entry.component == "weight_shape"
+                if entry.component
+                == (
+                    "weight_shape"
+                    if checkpoint_format == _COMPRESSED_TENSORS
+                    else "qzeros"
+                )
             )
         )
     if len(expert_sizes) != 1:
         raise ValueError("Routed experts do not have a uniform stored size")
-    if expert_shape_sizes != {48}:
-        raise ValueError("Unexpected routed expert shape metadata size")
+    expected_excluded_bytes = (
+        48 if checkpoint_format == _COMPRESSED_TENSORS else 294_912
+    )
+    if excluded_runtime_sizes != {expected_excluded_bytes}:
+        raise ValueError("Unexpected routed expert auxiliary component size")
 
     checkpoint_expert_bytes = expert_sizes.pop()
     runtime_shape_bytes = 2 * 2 * 2
-    runtime_expert_bytes = checkpoint_expert_bytes - 48 + runtime_shape_bytes
+    runtime_expert_bytes = (
+        checkpoint_expert_bytes - expected_excluded_bytes + runtime_shape_bytes
+    )
     return checkpoint_expert_bytes, runtime_expert_bytes
 
 
@@ -306,7 +351,9 @@ def build_glm_w4a16_manifest(model_path: str | Path) -> TieredMoECheckpointManif
     model_path = Path(model_path).resolve()
     config_path = model_path / _CONFIG_FILE
     index_path = model_path / _INDEX_FILE
-    routed_layers = _validate_glm_w4a16_config(_read_json(config_path))
+    routed_layers, checkpoint_format, group_size = _validate_glm_w4a16_config(
+        _read_json(config_path)
+    )
     index = _read_json(index_path)
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
@@ -321,20 +368,37 @@ def build_glm_w4a16_manifest(model_path: str | Path) -> TieredMoECheckpointManif
         names_by_shard[shard].add(name)
 
     entries = []
+    seen_names = set()
     for shard, expected_names in sorted(names_by_shard.items()):
         shard_path = model_path / shard
         if not shard_path.is_file():
             raise ValueError(f"Checkpoint shard is missing: {shard_path}")
         with safe_open(shard_path, framework="pt", device="cpu") as file:
             actual_names = set(file.keys())
-            if actual_names != expected_names:
+            if not expected_names.issubset(actual_names):
                 missing = len(expected_names - actual_names)
-                unexpected = len(actual_names - expected_names)
+                raise ValueError(
+                    f"Safetensors index mismatch in {shard}: {missing} missing tensors"
+                )
+            unexpected_names = actual_names - expected_names
+            invalid_unexpected = (
+                unexpected_names
+                if checkpoint_format == _COMPRESSED_TENSORS
+                else {
+                    name
+                    for name in unexpected_names
+                    if ".self_attn.indexer." not in name
+                }
+            )
+            if invalid_unexpected:
                 raise ValueError(
                     f"Safetensors index mismatch in {shard}: "
-                    f"{missing} missing and {unexpected} unexpected tensors"
+                    f"{len(invalid_unexpected)} unexpected tensors"
                 )
             for name in sorted(actual_names):
+                if name in seen_names:
+                    raise ValueError(f"Duplicate safetensors tensor: {name}")
+                seen_names.add(name)
                 tensor_slice = file.get_slice(name)
                 entries.append(
                     _make_entry(
@@ -347,16 +411,19 @@ def build_glm_w4a16_manifest(model_path: str | Path) -> TieredMoECheckpointManif
 
     manifest_entries = tuple(sorted(entries, key=lambda entry: entry.name))
     checkpoint_bytes = sum(entry.num_bytes for entry in manifest_entries)
+    indexed_bytes = sum(
+        entry.num_bytes for entry in manifest_entries if entry.name in weight_map
+    )
     metadata = index.get("metadata", {})
     declared_bytes = metadata.get("total_size") if isinstance(metadata, dict) else None
-    if declared_bytes != checkpoint_bytes:
+    if checkpoint_format == _COMPRESSED_TENSORS and declared_bytes != indexed_bytes:
         raise ValueError(
             "Safetensors index total_size mismatch: "
-            f"declared {declared_bytes}, headers contain {checkpoint_bytes}"
+            f"declared {declared_bytes}, indexed headers contain {indexed_bytes}"
         )
 
     checkpoint_expert_bytes, runtime_expert_bytes = _validate_expert_entries(
-        manifest_entries, routed_layers, 256
+        manifest_entries, routed_layers, 256, checkpoint_format
     )
     routed_expert_bytes = sum(
         entry.num_bytes for entry in manifest_entries if entry.is_routed_expert
@@ -373,4 +440,11 @@ def build_glm_w4a16_manifest(model_path: str | Path) -> TieredMoECheckpointManif
         num_experts=256,
         checkpoint_expert_bytes=checkpoint_expert_bytes,
         runtime_expert_bytes=runtime_expert_bytes,
+        runtime_expert_format=(
+            "vllm_marlin_static_w4a16"
+            if group_size == 128
+            else f"vllm_marlin_static_w4a16_g{group_size}"
+        ),
+        checkpoint_expert_format=checkpoint_format,
+        group_size=group_size,
     )

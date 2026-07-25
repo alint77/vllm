@@ -81,7 +81,16 @@ def _linear_component_placement(
     if suffix.endswith(".weight_shape"):
         return RuntimePlacement.REPLICATED
     if suffix.endswith(
-        (".weight", ".weight_packed", ".weight_scale", ".weight_scale_inv")
+        (
+            ".weight",
+            ".weight_packed",
+            ".weight_scale",
+            ".weight_scale_inv",
+            ".qweight",
+            ".qzeros",
+            ".scales",
+            ".g_idx",
+        )
     ):
         return parallel
     raise ValueError(f"Unsupported quantized linear component: {suffix}")
@@ -253,9 +262,18 @@ def build_glm_non_routed_runtime_inventory(
     replicated_bytes = totals[RuntimePlacement.REPLICATED]
     sharded_runtime_bytes = sharded_checkpoint_bytes // tp_size
     ep_sharded_checkpoint_bytes = totals[RuntimePlacement.EP_SHARDED]
-    if ep_sharded_checkpoint_bytes % tp_size:
+    ep_runtime_bytes = ep_sharded_checkpoint_bytes
+    if manifest.checkpoint_expert_format == "auto_round_gptq":
+        mtp_qzeros_bytes = sum(
+            entry.num_bytes
+            for entry in manifest.entries
+            if entry.name.startswith("model.layers.78.mlp.experts.")
+            and entry.name.endswith(".qzeros")
+        )
+        ep_runtime_bytes -= mtp_qzeros_bytes // 2
+    if ep_runtime_bytes % tp_size:
         raise ValueError("MTP expert tensor bytes are not evenly EP-shardable")
-    ep_sharded_runtime_bytes = ep_sharded_checkpoint_bytes // tp_size
+    ep_sharded_runtime_bytes = ep_runtime_bytes // tp_size
     mtp_indexer_wk_bytes = sum(
         entry.num_bytes
         for entry in manifest.entries
@@ -266,7 +284,11 @@ def build_glm_non_routed_runtime_inventory(
         for entry in manifest.entries
         if entry.name == "model.layers.78.self_attn.indexer.wk.weight_scale_inv"
     )
-    format_conversion_bytes = mtp_indexer_wk_bytes - mtp_indexer_scale_bytes
+    format_conversion_bytes = (
+        mtp_indexer_wk_bytes - mtp_indexer_scale_bytes
+        if manifest.checkpoint_expert_format == "compressed_tensors"
+        else 0
+    )
     runtime_bytes_per_rank = (
         replicated_bytes
         + sharded_runtime_bytes

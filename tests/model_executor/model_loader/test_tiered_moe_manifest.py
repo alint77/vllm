@@ -20,6 +20,7 @@ from vllm.model_executor.model_loader import tiered_moe_manifest as manifest_mod
 from vllm.model_executor.model_loader import tiered_moe_streaming as streaming_module
 from vllm.model_executor.model_loader.tiered_moe_conversion import (
     OneExpertCheckpointStager,
+    is_glm_expert_checkpoint_tensor,
 )
 from vllm.model_executor.model_loader.tiered_moe_kv import (
     get_tiered_kv_available_memory,
@@ -63,6 +64,7 @@ from vllm.model_executor.model_loader.tiered_moe_storage import (
     ExpertTierStorage,
     LayerTieredExpertStorage,
     build_expert_component_views,
+    glm_marlin_components,
 )
 from vllm.model_executor.model_loader.tiered_moe_streaming import (
     TieredMoEExpertLoader,
@@ -110,6 +112,19 @@ def make_glm_config() -> dict:
             },
         },
     }
+
+
+def make_auto_round_glm_config() -> dict:
+    config = make_glm_config()
+    config["quantization_config"] = {
+        "bits": 4,
+        "data_type": "int",
+        "group_size": 64,
+        "packing_format": "auto_round:auto_gptq",
+        "quant_method": "auto-round",
+        "sym": True,
+    }
+    return config
 
 
 def test_host_uva_kv_plan_preserves_native_block_count_and_tiers():
@@ -224,6 +239,16 @@ def test_glm_descriptor_rejects_wrong_topk():
         _validate_glm_w4a16_config(config)
 
 
+def test_glm_descriptor_accepts_auto_round_w4g64():
+    layers, checkpoint_format, group_size = _validate_glm_w4a16_config(
+        make_auto_round_glm_config()
+    )
+
+    assert layers == tuple(range(3, 78))
+    assert checkpoint_format == "auto_round_gptq"
+    assert group_size == 64
+
+
 def test_expert_inventory_includes_every_stored_component():
     entries = []
     shapes = {
@@ -254,11 +279,51 @@ def test_expert_inventory_includes_every_stored_component():
             entries.append(_make_entry(name, "model.safetensors", dtype, shape))
 
     checkpoint_bytes, runtime_bytes = _validate_expert_entries(
-        tuple(entries), (3,), num_experts=1
+        tuple(entries), (3,), num_experts=1, checkpoint_format="compressed_tensors"
     )
 
     assert checkpoint_bytes == 19_464_240
     assert runtime_bytes == 19_464_200
+
+
+def test_auto_round_expert_inventory_drops_symmetric_zero_points_at_runtime():
+    entries = []
+    shapes = {
+        "gate_proj": {
+            "qweight": ((768, 2048), "I32"),
+            "qzeros": ((96, 256), "I32"),
+            "scales": ((96, 2048), "F16"),
+        },
+        "up_proj": {
+            "qweight": ((768, 2048), "I32"),
+            "qzeros": ((96, 256), "I32"),
+            "scales": ((96, 2048), "F16"),
+        },
+        "down_proj": {
+            "qweight": ((256, 6144), "I32"),
+            "qzeros": ((32, 768), "I32"),
+            "scales": ((32, 6144), "F16"),
+        },
+    }
+    for projection, components in shapes.items():
+        for component, (shape, dtype) in components.items():
+            name = f"model.layers.3.mlp.experts.0.{projection}.{component}"
+            entries.append(_make_entry(name, "model.safetensors", dtype, shape))
+
+    checkpoint_bytes, runtime_bytes = _validate_expert_entries(
+        tuple(entries), (3,), num_experts=1, checkpoint_format="auto_round_gptq"
+    )
+
+    assert checkpoint_bytes == 20_348_928
+    assert runtime_bytes == 20_054_024
+
+
+def test_mtp_experts_are_not_intercepted_by_tiered_streaming():
+    name = "model.layers.78.mlp.experts.0.gate_proj.qweight"
+
+    entry = _make_entry(name, "model.safetensors", "I32", (768, 2048))
+    assert not entry.is_routed_expert
+    assert not is_glm_expert_checkpoint_tensor(name)
 
 
 def write_tiny_checkpoint(tmp_path, declared_bytes: int = 16):
@@ -275,12 +340,14 @@ def write_tiny_checkpoint(tmp_path, declared_bytes: int = 16):
 def test_manifest_uses_header_shapes_for_exact_bytes(tmp_path, monkeypatch):
     write_tiny_checkpoint(tmp_path)
     monkeypatch.setattr(
-        manifest_module, "_validate_glm_w4a16_config", lambda config: (3,)
+        manifest_module,
+        "_validate_glm_w4a16_config",
+        lambda config: ((3,), "compressed_tensors", 128),
     )
     monkeypatch.setattr(
         manifest_module,
         "_validate_expert_entries",
-        lambda entries, routed_layers, num_experts: (0, 0),
+        lambda entries, routed_layers, num_experts, checkpoint_format: (0, 0),
     )
 
     manifest = build_glm_w4a16_manifest(tmp_path)
@@ -294,7 +361,9 @@ def test_manifest_uses_header_shapes_for_exact_bytes(tmp_path, monkeypatch):
 def test_manifest_rejects_index_byte_mismatch(tmp_path, monkeypatch):
     write_tiny_checkpoint(tmp_path, declared_bytes=15)
     monkeypatch.setattr(
-        manifest_module, "_validate_glm_w4a16_config", lambda config: (3,)
+        manifest_module,
+        "_validate_glm_w4a16_config",
+        lambda config: ((3,), "compressed_tensors", 128),
     )
 
     with pytest.raises(ValueError, match="total_size mismatch"):
@@ -689,6 +758,18 @@ def test_glm_marlin_destination_layout_is_exact_and_non_overlapping():
     assert intervals[-1][1] == buffer.data_ptr() + buffer.numel()
 
 
+def test_auto_round_marlin_destination_layout_has_group64_scales():
+    components = glm_marlin_components(64)
+    expert_bytes = sum(component.bytes_per_expert for component in components)
+    buffer = torch.empty(expert_bytes, dtype=torch.uint8)
+
+    views = build_expert_component_views(buffer, expert_count=1, group_size=64)
+
+    assert expert_bytes == 20_054_024
+    assert views["w13_weight_scale"].shape == (1, 96, 4096)
+    assert views["w2_weight_scale"].shape == (1, 32, 6144)
+
+
 def test_final_destination_commits_exactly_one_complete_expert():
     buffer = torch.zeros(2 * GLM_MARLIN_EXPERT_BYTES, dtype=torch.uint8)
     views = build_expert_component_views(buffer, expert_count=2)
@@ -736,6 +817,36 @@ def test_one_expert_stager_is_complete_and_bounded():
     assert bundle.layer_id == 3
     assert bundle.expert_id == 7
     assert bundle.num_bytes == 19_464_240
+    stager.finish()
+
+
+def test_one_auto_round_expert_stager_is_complete_and_bounded():
+    stager = OneExpertCheckpointStager()
+    shapes = {
+        "gate_proj": {
+            "qweight": ((768, 2048), torch.int32),
+            "qzeros": ((96, 256), torch.int32),
+            "scales": ((96, 2048), torch.float16),
+        },
+        "up_proj": {
+            "qweight": ((768, 2048), torch.int32),
+            "qzeros": ((96, 256), torch.int32),
+            "scales": ((96, 2048), torch.float16),
+        },
+        "down_proj": {
+            "qweight": ((256, 6144), torch.int32),
+            "qzeros": ((32, 768), torch.int32),
+            "scales": ((32, 6144), torch.float16),
+        },
+    }
+    bundle = None
+    for projection, components in shapes.items():
+        for component, (shape, dtype) in components.items():
+            name = f"model.layers.3.mlp.experts.7.{projection}.{component}"
+            bundle = stager.add(name, torch.empty(shape, dtype=dtype))
+
+    assert bundle is not None
+    assert bundle.num_bytes == 20_348_928
     stager.finish()
 
 
