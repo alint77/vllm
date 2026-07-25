@@ -21,7 +21,6 @@ Run on a Booster node — login-node C2C and clock behaviour do not transfer.
 """
 
 import argparse
-import itertools
 import json
 
 import torch
@@ -86,18 +85,49 @@ def make_tier(num_experts, k, n, device, pinned, numa_node=0):
     return q, s
 
 
-def routing(m, num_experts, activated, device, seed):
-    """topk_ids hitting exactly `activated` distinct experts, block-aligned."""
+def tier_map(all_ids, tier_ids, num_experts, device):
+    """expert_map: global expert id -> local index within this tier, else -1."""
+    m = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
+    m[torch.as_tensor(tier_ids, device=device)] = torch.arange(
+        len(tier_ids), dtype=torch.int32, device=device
+    )
+    return m
+
+
+def global_routing(m, hot_ids, cold_ids, num_experts, device, seed, cold_share):
+    """One shared topk_ids over both tiers, as the production dispatch builds it.
+
+    Assignments are split so the cold tier receives `cold_share` of the routing
+    mass. Passing all mass to a handful of cold experts is what makes a tier
+    re-stream its weights, so this split matters more than the expert counts.
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    n = m * TOP_K
+    n_cold = int(round(n * cold_share))
+    pick = torch.cat(
+        [
+            torch.as_tensor(cold_ids)[
+                torch.randint(0, len(cold_ids), (n_cold,), generator=g)
+            ],
+            torch.as_tensor(hot_ids)[
+                torch.randint(0, len(hot_ids), (n - n_cold,), generator=g)
+            ],
+        ]
+    )
+    pick = pick[torch.randperm(n, generator=g)]
+    return pick.view(m, TOP_K).to(device).to(torch.int32)
+
+
+def align(topk_ids, bsm, num_experts, emap):
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
 
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    live = torch.randperm(num_experts, generator=g)[:activated]
-    ids = live[torch.randint(0, activated, (m, TOP_K), generator=g)]
-    topk_ids = ids.to(device).to(torch.int32)
-    tok, expert_ids, n_post = moe_align_block_size(topk_ids, BLOCK_M, num_experts)
-    return topk_ids, tok, expert_ids, n_post
+    tok, eids, npost = moe_align_block_size(
+        topk_ids, bsm, num_experts, emap, ignore_invalid_experts=True
+    )
+    blocks = int((eids >= 0).sum())
+    return tok, eids, npost, blocks
 
 
 def time_call(fn, warmup=20, iters=100):
@@ -152,78 +182,184 @@ def build_gemm(a, out, q, s, ws, tok, eids, npost, weights, m, n, k, cfg):
     return run
 
 
+def run_tier(
+    label,
+    q,
+    sc,
+    ws,
+    a,
+    out,
+    weights,
+    topk_ids,
+    emap,
+    m,
+    n,
+    k,
+    num_experts,
+    wbytes,
+    roof,
+    bsms,
+    cfgs,
+):
+    """Time one tier over block sizes and launch configs; report physical BW."""
+    rows = []
+    for bsm in bsms:
+        tok, eids, npost, blocks = align(topk_ids, bsm, num_experts, emap)
+        phys = blocks * wbytes
+        for cfg in cfgs:
+            try:
+                us = time_call(
+                    build_gemm(
+                        a, out, q, sc, ws, tok, eids, npost, weights, m, n, k, cfg
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"    bsm={bsm:2d} {str(cfg):14s} unsupported "
+                    f"({type(exc).__name__})"
+                )
+                continue
+            bw = phys / (us * 1e-6) / 1e9
+            print(
+                f"    bsm={bsm:2d} {str(cfg):14s} {us:8.2f} us  "
+                f"{blocks:3d} blocks  {phys / 1e6:7.1f} MB physical  "
+                f"{bw:7.1f} GB/s  {100 * bw * 1e9 / roof:5.1f}% roof"
+            )
+            rows.append(
+                dict(
+                    tier=label,
+                    bsm=bsm,
+                    cfg=list(cfg),
+                    us=us,
+                    blocks=blocks,
+                    phys_bytes=phys,
+                    gbs=bw,
+                )
+            )
+    return rows
+
+
 def single(args, dev):
+    """Both tiers resident in HBM: isolates the effect of routing share."""
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    print(f"SMs={sms}  configs are (blocks_per_sm, thread_n, thread_k); -1 = auto\n")
+    print(f"SMs={sms}\n")
+    hot_ids = list(range(args.hot_act))
+    cold_ids = list(range(args.hot_act, args.hot_act + args.cold_act))
     rows = []
     for shard, k, n in (
         ("w13", HIDDEN, 2 * INTERMEDIATE),
         ("w2", INTERMEDIATE, HIDDEN),
     ):
-        q, s = make_tier(args.experts, k, n, dev, pinned=False)
+        q, sc = make_tier(args.experts, k, n, dev, pinned=False)
         ws = marlin_make_workspace_new(dev, 4)
         wbytes = W13_BYTES if shard == "w13" else W2_BYTES
-        for m, act in itertools.product(args.tokens, args.activated):
-            if act > args.experts:
-                continue
-            _, tok, eids, npost = routing(m, args.experts, act, dev, args.seed)
+        for m in args.tokens:
+            topk = global_routing(
+                m, hot_ids, cold_ids, args.experts, dev, args.seed, args.cold_share
+            )
             a = torch.randn((m, k), dtype=torch.bfloat16, device=dev)
             out = torch.empty((m * TOP_K, n), dtype=torch.bfloat16, device=dev)
-            weights = torch.ones((m, TOP_K), dtype=torch.float32, device=dev)
-            base = None
-            print(
-                f"--- {shard}: M={m} activated={act} "
-                f"({act * wbytes / 1e6:.0f} MB of weights)"
-            )
-            for cfg in args.configs:
-                try:
-                    us = time_call(
-                        build_gemm(
-                            a, out, q, s, ws, tok, eids, npost, weights, m, n, k, cfg
-                        )
-                    )
-                except Exception as exc:  # unsupported launch config
-                    print(f"    {str(cfg):18s}  unsupported ({type(exc).__name__})")
-                    continue
-                bw = act * wbytes / (us * 1e-6) / 1e12
-                base = base if base is not None else us
+            w = torch.ones((m, TOP_K), dtype=torch.float32, device=dev)
+            for label, ids in (("hot", hot_ids), ("cold", cold_ids)):
+                emap = tier_map(None, ids, args.experts, dev)
                 print(
-                    f"    {str(cfg):18s} {us:8.2f} us  {bw:6.2f} TB/s  "
-                    f"{100 * bw / 3.5:5.1f}% HBM  {us / base:5.3f}x"
+                    f"--- {shard} {label}: M={m}, {len(ids)} experts, "
+                    f"cold_share={args.cold_share}"
                 )
-                rows.append(
-                    dict(shard=shard, m=m, activated=act, cfg=list(cfg), us=us, tbs=bw)
+                rows += run_tier(
+                    f"{shard}-{label}",
+                    q,
+                    sc,
+                    ws,
+                    a,
+                    out,
+                    w,
+                    topk,
+                    emap,
+                    m,
+                    n,
+                    k,
+                    args.experts,
+                    wbytes,
+                    3.5e12,
+                    args.block_sizes,
+                    args.configs,
                 )
-        del q, s
+        del q, sc
         torch.accelerator.empty_cache()
     return rows
 
 
 def overlap(args, dev):
-    """Hot tier in HBM + cold tier in pinned Grace, on two streams."""
+    """Hot tier in HBM + cold tier in pinned Grace, sharing one routing."""
     k, n = HIDDEN, 2 * INTERMEDIATE
-    hq, hs = make_tier(args.hot_experts, k, n, dev, pinned=False)
-    cq, cs = make_tier(
-        args.cold_experts, k, n, dev, pinned=True, numa_node=args.numa_node
-    )
+    hot_ids = list(range(args.hot_act))
+    cold_ids = list(range(args.hot_act, args.hot_act + args.cold_act))
+    hq, hs = make_tier(args.experts, k, n, dev, pinned=False)
+    cq, cs = make_tier(args.experts, k, n, dev, pinned=True, numa_node=args.numa_node)
     ws_h = marlin_make_workspace_new(dev, 4)
     ws_c = marlin_make_workspace_new(dev, 4)
     aux = torch.cuda.Stream()
     rows = []
     for m in args.tokens:
+        topk = global_routing(
+            m, hot_ids, cold_ids, args.experts, dev, args.seed, args.cold_share
+        )
         a = torch.randn((m, k), dtype=torch.bfloat16, device=dev)
         oh = torch.empty((m * TOP_K, n), dtype=torch.bfloat16, device=dev)
         oc = torch.empty((m * TOP_K, n), dtype=torch.bfloat16, device=dev)
         w = torch.ones((m, TOP_K), dtype=torch.float32, device=dev)
-        _, th, eh, ph = routing(m, args.hot_experts, args.hot_act, dev, args.seed)
-        _, tc, ec, pc = routing(m, args.cold_experts, args.cold_act, dev, args.seed + 1)
+        mh = tier_map(None, hot_ids, args.experts, dev)
+        mc = tier_map(None, cold_ids, args.experts, dev)
         print(
-            f"--- overlap M={m}: hot {args.hot_act} experts (HBM), "
-            f"cold {args.cold_act} experts (Grace)"
+            f"--- M={m}: hot {len(hot_ids)} (HBM) / cold {len(cold_ids)} "
+            f"(Grace), cold_share={args.cold_share}"
         )
-        for hb, cb in itertools.product(args.hot_bps, args.cold_bps):
-            fh = build_gemm(a, oh, hq, hs, ws_h, th, eh, ph, w, m, n, k, (hb, -1, -1))
-            fc = build_gemm(a, oc, cq, cs, ws_c, tc, ec, pc, w, m, n, k, (cb, -1, -1))
+        print("  HOT tier alone (HBM roof 3.5 TB/s)")
+        rows += run_tier(
+            "hot",
+            hq,
+            hs,
+            ws_h,
+            a,
+            oh,
+            w,
+            topk,
+            mh,
+            m,
+            n,
+            k,
+            args.experts,
+            W13_BYTES,
+            3.5e12,
+            args.block_sizes,
+            [(-1, -1, -1)],
+        )
+        print("  COLD tier alone (C2C roof 421 GB/s)")
+        rows += run_tier(
+            "cold",
+            cq,
+            cs,
+            ws_c,
+            a,
+            oc,
+            w,
+            topk,
+            mc,
+            m,
+            n,
+            k,
+            args.experts,
+            W13_BYTES,
+            421e9,
+            args.block_sizes,
+            [(-1, -1, -1)],
+        )
+        for bsm in args.block_sizes:
+            th, eh, ph, bh = align(topk, bsm, args.experts, mh)
+            tc, ec, pc, bc = align(topk, bsm, args.experts, mc)
+            fh = build_gemm(a, oh, hq, hs, ws_h, th, eh, ph, w, m, n, k, (-1, -1, -1))
+            fc = build_gemm(a, oc, cq, cs, ws_c, tc, ec, pc, w, m, n, k, (-1, -1, -1))
 
             def both(fh=fh, fc=fc):
                 aux.wait_stream(torch.cuda.current_stream())
@@ -232,21 +368,24 @@ def overlap(args, dev):
                 fh()
                 torch.cuda.current_stream().wait_stream(aux)
 
-            try:
-                u_h, u_c, u_b = time_call(fh), time_call(fc), time_call(both)
-            except Exception as exc:
-                print(f"    hot={hb} cold={cb}  unsupported ({type(exc).__name__})")
-                continue
+            u_h, u_c, u_b = time_call(fh), time_call(fc), time_call(both)
             ideal = max(u_h, u_c)
             print(
-                f"    hot_bps={hb:2d} cold_bps={cb:2d}  hot {u_h:7.1f}  "
-                f"cold {u_c:7.1f}  union {u_b:7.1f} us  "
-                f"(serial {u_h + u_c:7.1f}, ideal {ideal:7.1f}, "
-                f"over ideal {100 * (u_b - ideal) / ideal:+5.1f}%)"
+                f"  bsm={bsm:2d} overlap: hot {u_h:7.1f} ({bh:3d} blk)  "
+                f"cold {u_c:7.1f} ({bc:3d} blk)  union {u_b:7.1f}  "
+                f"serial {u_h + u_c:7.1f}  ideal {ideal:7.1f}  "
+                f"over ideal {100 * (u_b - ideal) / ideal:+5.1f}%"
             )
             rows.append(
                 dict(
-                    m=m, hot_bps=hb, cold_bps=cb, hot_us=u_h, cold_us=u_c, union_us=u_b
+                    tier="overlap",
+                    m=m,
+                    bsm=bsm,
+                    hot_us=u_h,
+                    cold_us=u_c,
+                    union_us=u_b,
+                    hot_blocks=bh,
+                    cold_blocks=bc,
                 )
             )
     return rows
@@ -255,24 +394,22 @@ def overlap(args, dev):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=("single", "overlap", "both"), default="both")
-    p.add_argument("--tokens", type=int, nargs="+", default=[8, 12, 16, 32])
-    p.add_argument("--activated", type=int, nargs="+", default=[5, 16, 22])
+    p.add_argument("--tokens", type=int, nargs="+", default=[8, 16, 32])
     p.add_argument("--experts", type=int, default=64)
-    p.add_argument("--hot-experts", type=int, default=40)
-    p.add_argument("--cold-experts", type=int, default=24)
-    p.add_argument("--hot-act", type=int, default=19)
-    p.add_argument("--cold-act", type=int, default=3)
-    p.add_argument("--hot-bps", type=int, nargs="+", default=[-1, 1, 2, 3])
-    p.add_argument("--cold-bps", type=int, nargs="+", default=[-1, 1, 2, 3])
+    p.add_argument("--hot-act", type=int, default=19, help="activated hot experts")
+    p.add_argument("--cold-act", type=int, default=3, help="activated cold experts")
+    p.add_argument(
+        "--cold-share",
+        type=float,
+        default=0.13,
+        help="fraction of routing mass landing on the cold tier",
+    )
+    p.add_argument("--block-sizes", type=int, nargs="+", default=[16])
     p.add_argument("--numa-node", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output", type=str)
     args = p.parse_args()
-    args.configs = [(b, -1, -1) for b in (-1, 1, 2, 3, 4)] + [
-        (-1, 128, 128),
-        (-1, 256, 64),
-        (2, 128, 128),
-    ]
+    args.configs = [(b, -1, -1) for b in (-1, 2, 3)]
 
     dev = torch.device("cuda:0")
     torch.accelerator.set_device_index(dev.index or 0)
