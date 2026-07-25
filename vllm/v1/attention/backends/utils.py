@@ -904,7 +904,11 @@ def get_dcp_local_seq_lens(
         )
         seq_lens_tiled = seq_lens_i32.unsqueeze(-1)
     else:
-        rank_offsets = torch.tensor(dcp_rank, dtype=torch.int32, device=seq_lens.device)
+        # Keep the single-rank offset a Python scalar. Materializing it as a 0-d
+        # device tensor costs a pageable host-to-device copy, which blocks the
+        # host until the stream drains -- once per speculative draft step when
+        # this runs inside draft attention metadata construction.
+        rank_offsets = dcp_rank
         seq_lens_tiled = seq_lens_i32
     base = (
         seq_lens_tiled
