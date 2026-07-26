@@ -709,6 +709,58 @@ async def _collect_metrics_stream_chunks(
     return chunks
 
 
+@pytest.mark.asyncio
+async def test_streamed_routing_trace_counts_all_output_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_ROUTING_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ROUTING_TRACE_VERIFICATION_SIZE", "2")
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        stream=True,
+    )
+    routes = np.zeros((3, 78, 8), dtype=np.uint16)
+
+    async def result_generator():
+        for token_ids, finish_reason, routed_experts in (
+            ([100, 101], None, None),
+            ([102], "stop", routes),
+        ):
+            yield RequestOutput(
+                request_id="test-id",
+                prompt="Test prompt",
+                prompt_token_ids=[1, 2, 3],
+                prompt_logprobs=None,
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text="text",
+                        token_ids=token_ids,
+                        cumulative_logprob=None,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                        routed_experts=routed_experts,
+                    )
+                ],
+                finished=finish_reason is not None,
+            )
+
+    async for _ in serving.chat_completion_stream_generator(
+        request,
+        result_generator(),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        pass
+
+    record = json.loads((tmp_path / "manifest.jsonl").read_text())
+    assert record["output_tokens"] == 3
+
+
 def test_build_per_request_timing_metrics_valid_timestamps():
     metrics = build_per_request_timing_metrics(
         _PER_REQUEST_STATS, num_generation_tokens=10

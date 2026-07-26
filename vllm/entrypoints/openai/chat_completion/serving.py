@@ -619,7 +619,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     _record_routing_trace(
                         request_id,
                         output.routed_experts,
-                        len(output.token_ids),
+                        previous_num_tokens[i] + len(output.token_ids),
                     )
 
                     if request.logprobs and (
