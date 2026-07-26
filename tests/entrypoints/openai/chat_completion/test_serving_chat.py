@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 import pytest_asyncio
 from openai import OpenAI
@@ -29,6 +30,7 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     OpenAIServingChat,
     _get_mm_token_counts,
     _make_prompt_tokens_details,
+    _record_routing_trace,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
@@ -63,6 +65,24 @@ _PER_REQUEST_STATS = RequestStateStats(
     last_token_ts=3.0,
     num_generation_tokens=2,
 )
+
+
+def test_record_routing_trace_skips_prompt_sentinel(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_ROUTING_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ROUTING_TRACE_VERIFICATION_SIZE", "2")
+    routes = np.arange(3 * 78 * 8, dtype=np.uint16).reshape(3, 78, 8)
+
+    _record_routing_trace("request-id", routes, output_tokens=7)
+
+    trace_files = list(tmp_path.glob("*.npy"))
+    assert len(trace_files) == 1
+    np.testing.assert_array_equal(np.load(trace_files[0]), routes[1:])
+    record = json.loads((tmp_path / "manifest.jsonl").read_text())
+    assert record["file"] == trace_files[0].name
+    assert record["request_id"] == "request-id"
+    assert record["output_tokens"] == 7
+    assert record["prefix_rows"] == 1
+    assert record["routed_positions"] == 2
 
 
 @pytest.fixture(scope="module")

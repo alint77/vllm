@@ -3,10 +3,14 @@
 
 import asyncio
 import io
+import json
+import os
 import time
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Final, cast
 
 import numpy as np
@@ -68,6 +72,43 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
 
 logger = init_logger(__name__)
+
+
+def _record_routing_trace(
+    request_id: str,
+    routed_experts: np.ndarray | None,
+    output_tokens: int,
+) -> None:
+    trace_dir = os.getenv("VLLM_ROUTING_TRACE_DIR")
+    if not trace_dir or routed_experts is None:
+        return
+    try:
+        verification_size = int(os.getenv("VLLM_ROUTING_TRACE_VERIFICATION_SIZE", "1"))
+        prefix_rows = routed_experts.shape[0] % verification_size
+        routes = routed_experts[prefix_rows:]
+        if not routes.size:
+            return
+        root = Path(trace_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        name = f"{time.time_ns()}-{uuid.uuid4().hex}.npy"
+        path = root / name
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("wb") as file:
+            np.save(file, routes)
+        tmp.replace(path)
+        record = {
+            "file": name,
+            "request_id": request_id,
+            "output_tokens": output_tokens,
+            "prefix_rows": prefix_rows,
+            "routed_positions": int(routes.shape[0]),
+            "shape": list(routes.shape),
+            "verification_size": verification_size,
+        }
+        with (root / "manifest.jsonl").open("a") as file:
+            file.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        logger.exception("Failed to record routed-expert trace")
 
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
@@ -319,6 +360,14 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                if os.getenv("VLLM_ROUTING_TRACE_DIR"):
+                    sampling_params.routed_experts_prompt_start = max(
+                        0, len(prompt_token_ids) - 1
+                    )
+                    sampling_params.extra_args = dict(
+                        sampling_params.extra_args or {},
+                        return_rejected_routed_experts=True,
+                    )
 
             self._log_inputs(
                 sub_request_id,
@@ -567,6 +616,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     parser = parsers[i]
                     if finish_reason_sent[i]:
                         continue
+                    _record_routing_trace(
+                        request_id,
+                        output.routed_experts,
+                        len(output.token_ids),
+                    )
 
                     if request.logprobs and (
                         request.top_logprobs is not None or request.logprob_token_ids
@@ -859,6 +913,11 @@ class OpenAIServingChat(GenerateBaseServing):
             self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
         )
         for output in final_res.outputs:
+            _record_routing_trace(
+                request_id,
+                output.routed_experts,
+                len(output.token_ids),
+            )
             # check for error finish reason and raise GenerationError
             # finish_reason='error' indicates a retryable request-level internal error
             self._raise_if_error(output.finish_reason, request_id)
