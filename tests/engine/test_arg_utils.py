@@ -253,8 +253,8 @@ def test_tiered_moe_config_enforces_reserves_and_enablement():
         TieredMoEConfig(plan_only=True)
     with pytest.raises(ValueError, match="requires grace_machine_profile"):
         TieredMoEConfig(enabled=True, plan_only=True)
-    with pytest.raises(ValueError, match="at least 7 GB HBM"):
-        TieredMoEConfig(enabled=True, hbm_reserve_gb=6.99)
+    with pytest.raises(ValueError, match="at least 5 GB HBM"):
+        TieredMoEConfig(enabled=True, hbm_reserve_gb=4.99)
     with pytest.raises(ValueError, match="at least 8 GB host"):
         TieredMoEConfig(enabled=True, host_reserve_gb=7.99)
 
@@ -266,6 +266,14 @@ def test_tiered_moe_config_enforces_reserves_and_enablement():
     )
     assert config.hbm_reserve_gb == 7
     assert config.host_reserve_gb == 8
+
+    low_reserve_config = TieredMoEConfig(
+        enabled=True,
+        hbm_reserve_gb=5,
+        mla_cache_tier="hbm",
+        grace_machine_profile="/tmp/gh200.json",
+    )
+    assert low_reserve_config.hbm_reserve_gb == 5
 
 
 @pytest.mark.parametrize("mode", ["warn", "error"])

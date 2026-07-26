@@ -115,7 +115,7 @@ def validate_tiered_moe_observed_hbm_reserve(
 
     planned_reserve = int(tiered.hbm_reserve_gb * 1_000_000_000)
     if planned_reserve < MINIMUM_HBM_RESERVE_BYTES:
-        raise RuntimeError("Tiered MoE planned HBM reserve is below 7 GB")
+        raise RuntimeError("Tiered MoE planned HBM reserve is below 5 GB")
     required_free = max(
         MINIMUM_OBSERVED_HBM_RESERVE_BYTES,
         planned_reserve - _OBSERVED_HBM_RESERVE_TOLERANCE_BYTES,

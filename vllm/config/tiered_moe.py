@@ -51,8 +51,8 @@ class TieredMoEConfig:
         """Enforce mandatory reserves whenever the tiered path is requested."""
         if self.plan_only and not self.enabled:
             raise ValueError("tiered_moe_plan_only requires enable_tiered_moe")
-        if self.enabled and self.hbm_reserve_gb < 7.0:
-            raise ValueError("Tiered MoE requires at least 7 GB HBM reserve")
+        if self.enabled and self.hbm_reserve_gb < 5.0:
+            raise ValueError("Tiered MoE requires at least 5 GB HBM reserve")
         if self.enabled and self.host_reserve_gb < 8.0:
             raise ValueError("Tiered MoE requires at least 8 GB host reserve")
         if self.enabled and self.grace_machine_profile is None:

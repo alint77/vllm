@@ -1212,6 +1212,16 @@ def test_observed_hbm_reserve_fails_closed_below_runtime_margin():
     with pytest.raises(RuntimeError, match="Replan more experts"):
         validate_tiered_moe_observed_hbm_reserve(config, 5_999_999_999)
 
+    low_reserve_config = SimpleNamespace(
+        tiered_moe_config=SimpleNamespace(enabled=True, hbm_reserve_gb=5.0)
+    )
+    assert (
+        validate_tiered_moe_observed_hbm_reserve(low_reserve_config, 4_000_000_000)
+        == 4_000_000_000
+    )
+    with pytest.raises(RuntimeError, match="Replan more experts"):
+        validate_tiered_moe_observed_hbm_reserve(low_reserve_config, 3_999_999_999)
+
 
 def make_entry(name: str, num_bytes: int) -> TensorManifestEntry:
     return TensorManifestEntry(

@@ -13,7 +13,7 @@ from vllm.model_executor.model_loader.tiered_moe_manifest import (
     TieredMoECheckpointManifest,
 )
 
-MINIMUM_HBM_RESERVE_BYTES = 7_000_000_000
+MINIMUM_HBM_RESERVE_BYTES = 5_000_000_000
 MINIMUM_HOST_RESERVE_BYTES = 8_000_000_000
 
 
