@@ -527,6 +527,7 @@ class EngineArgs:
     enable_tiered_moe: bool = TieredMoEConfig.enabled
     tiered_moe_backend: str = TieredMoEConfig.backend
     tiered_moe_placement_profile: str | None = TieredMoEConfig.placement_profile
+    tiered_moe_replica_assignment: str = TieredMoEConfig.replica_assignment
     tiered_moe_routing_trace_output: str | None = TieredMoEConfig.routing_trace_output
     tiered_moe_hbm_reserve_gb: float = TieredMoEConfig.hbm_reserve_gb
     tiered_moe_host_reserve_gb: float = TieredMoEConfig.host_reserve_gb
@@ -1265,6 +1266,10 @@ class EngineArgs:
         tiered_moe_group.add_argument(
             "--tiered-moe-placement-profile",
             **tiered_moe_kwargs["placement_profile"],
+        )
+        tiered_moe_group.add_argument(
+            "--tiered-moe-replica-assignment",
+            **tiered_moe_kwargs["replica_assignment"],
         )
         tiered_moe_group.add_argument(
             "--tiered-moe-routing-trace-output",
@@ -2415,6 +2420,7 @@ class EngineArgs:
             enabled=self.enable_tiered_moe,
             backend=self.tiered_moe_backend,
             placement_profile=self.tiered_moe_placement_profile,
+            replica_assignment=self.tiered_moe_replica_assignment,
             routing_trace_output=self.tiered_moe_routing_trace_output,
             hbm_reserve_gb=self.tiered_moe_hbm_reserve_gb,
             host_reserve_gb=self.tiered_moe_host_reserve_gb,

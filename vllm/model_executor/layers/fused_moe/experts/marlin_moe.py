@@ -78,6 +78,23 @@ class MarlinLaunchPolicy:
     max_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class MarlinPrealignedRouting:
+    """Routing metadata built upstream instead of by `moe_align_block_size`.
+
+    The tiered MoE path fuses replica assignment with both tiers' alignment
+    into one kernel, so the metadata already exists by the time Marlin runs.
+    Only applied at or below `max_tokens`, since the fused kernel is written
+    for decode shapes; above that the ordinary alignment runs.
+    """
+
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+    block_size_m: int
+    max_tokens: int = 0
+
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -289,6 +306,7 @@ def fused_marlin_moe(
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
     launch_policy: MarlinLaunchPolicy | None = None,
+    prealigned: MarlinPrealignedRouting | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -333,6 +351,7 @@ def fused_marlin_moe(
     num_bits = 4 if quant_type in bit4_scalar_types else 8
 
     M, K = hidden_states.size()
+    num_tokens = M
     E = w1.size(0)
     topk = topk_ids.size(1)
 
@@ -361,13 +380,21 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    # Gate on the real token count, not the per-rank estimate M is rescaled to
+    # above, so the bound matches the one the fused kernel was built for.
+    if prealigned is not None and prealigned.max_tokens >= num_tokens:
+        block_size_m = prealigned.block_size_m
+        sorted_token_ids = prealigned.sorted_token_ids
+        expert_ids = prealigned.expert_ids
+        num_tokens_post_padded = prealigned.num_tokens_post_padded
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -611,6 +638,9 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         # Set by the tiered MoE builder so each tier can be launched with a
         # shared-memory footprint that lets the two tiers be co-resident.
         self.launch_policy: MarlinLaunchPolicy | None = None
+        # Set per layer by the tiered MoE path when replica assignment has
+        # already produced this tier's alignment.
+        self.prealigned_routing: MarlinPrealignedRouting | None = None
         # TODO (varun) : Enable activation quantization
         assert (
             quant_config.use_mxfp4_w4a16
@@ -811,6 +841,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         if ctx is None:
             fused_marlin_moe(
                 launch_policy=self.launch_policy,
+                prealigned=self.prealigned_routing,
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
@@ -937,6 +968,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         return fused_marlin_moe(
             launch_policy=self.launch_policy,
+            prealigned=self.prealigned_routing,
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
