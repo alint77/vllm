@@ -26,7 +26,6 @@ class TieredMoEPlacementProfile:
     routed_layers: tuple[int, ...]
     owners: tuple[tuple[int, ...], ...]
     hot_experts: tuple[tuple[int, ...], ...]
-    secondary_ranks: tuple[tuple[int, ...], ...]
     optimizer: str
     training_request_hashes: tuple[str, ...]
     heldout_request_hashes: tuple[str, ...]
@@ -55,29 +54,10 @@ class TieredMoEPlacementProfile:
             )
         return result
 
-    def replicas_for_rank(self, ep_rank: int) -> dict[int, tuple[int, ...]]:
-        """Return secondary Grace copies assigned to one rank."""
-        if not 0 <= ep_rank < self.ep_size:
-            raise ValueError("EP rank is outside the placement profile")
-        return {
-            layer_id: tuple(
-                expert_id
-                for expert_id, rank in enumerate(layer_secondary)
-                if rank == ep_rank
-            )
-            for layer_id, layer_secondary in zip(
-                self.routed_layers, self.secondary_ranks
-            )
-        }
-
     def summary(self) -> dict[str, Any]:
         """Return profile identity and aggregate slot counts."""
         hot_by_rank = [
             sum(len(ids) for ids in self.hot_for_rank(rank).values())
-            for rank in range(self.ep_size)
-        ]
-        replicas_by_rank = [
-            sum(len(ids) for ids in self.replicas_for_rank(rank).values())
             for rank in range(self.ep_size)
         ]
         return {
@@ -89,7 +69,6 @@ class TieredMoEPlacementProfile:
             "num_experts": self.num_experts,
             "routed_layer_count": len(self.routed_layers),
             "hot_expert_slots_by_rank": hot_by_rank,
-            "replica_expert_slots_by_rank": replicas_by_rank,
             "optimizer": self.optimizer,
             "training_request_count": len(self.training_request_hashes),
             "heldout_request_count": len(self.heldout_request_hashes),
@@ -129,12 +108,10 @@ def load_tiered_moe_placement_profile(
         "training_request_hashes",
         "heldout_request_hashes",
     }
-    if data.get("profile_version") == 2:
-        expected_fields.add("secondary_ranks")
     if set(data) != expected_fields:
-        raise ValueError("Placement profile fields do not match its schema version")
-    if data["profile_version"] not in (1, 2):
-        raise ValueError("Only placement profile versions 1 and 2 are supported")
+        raise ValueError("Placement profile fields do not match schema version 1")
+    if data["profile_version"] != 1:
+        raise ValueError("Only placement profile version 1 is supported")
     if data["config_sha256"] != manifest.config_sha256:
         raise ValueError("Placement profile config fingerprint does not match")
     if data["index_sha256"] != manifest.index_sha256:
@@ -148,28 +125,19 @@ def load_tiered_moe_placement_profile(
 
     owners_value = data["owners"]
     hot_value = data["hot_experts"]
-    secondary_value = data.get(
-        "secondary_ranks",
-        [[-1] * manifest.num_experts for _ in manifest.routed_layers],
-    )
     layer_count = len(manifest.routed_layers)
     if not isinstance(owners_value, list) or len(owners_value) != layer_count:
         raise ValueError("Placement profile owners must have one row per layer")
     if not isinstance(hot_value, list) or len(hot_value) != layer_count:
         raise ValueError("Placement profile hot experts must have one row per layer")
-    if not isinstance(secondary_value, list) or len(secondary_value) != layer_count:
-        raise ValueError(
-            "Placement profile secondary ranks must have one row per layer"
-        )
 
     experts_per_rank, remainder = divmod(manifest.num_experts, ep_size)
     if remainder:
         raise ValueError("Placement profiles require evenly divisible experts")
     owners = []
     hot_experts = []
-    secondary_ranks = []
-    for layer_offset, (layer_owners, layer_hot, layer_secondary) in enumerate(
-        zip(owners_value, hot_value, secondary_value)
+    for layer_offset, (layer_owners, layer_hot) in enumerate(
+        zip(owners_value, hot_value)
     ):
         if (
             not isinstance(layer_owners, list)
@@ -196,26 +164,8 @@ def load_tiered_moe_placement_profile(
             raise ValueError("Placement profile contains an invalid hot expert")
         if len(set(layer_hot)) != len(layer_hot):
             raise ValueError("Placement profile hot experts must be unique per layer")
-        if (
-            not isinstance(layer_secondary, list)
-            or len(layer_secondary) != manifest.num_experts
-            or any(
-                not isinstance(rank, int)
-                or isinstance(rank, bool)
-                or not -1 <= rank < ep_size
-                for rank in layer_secondary
-            )
-        ):
-            raise ValueError("Placement profile contains an invalid secondary rank")
-        if any(
-            rank == layer_owners[expert_id]
-            for expert_id, rank in enumerate(layer_secondary)
-            if rank >= 0
-        ):
-            raise ValueError("Placement profile secondary rank matches its owner")
         owners.append(tuple(layer_owners))
         hot_experts.append(tuple(sorted(layer_hot)))
-        secondary_ranks.append(tuple(layer_secondary))
 
     optimizer = data["optimizer"]
     if not isinstance(optimizer, str) or not optimizer:
@@ -237,7 +187,6 @@ def load_tiered_moe_placement_profile(
         routed_layers=manifest.routed_layers,
         owners=tuple(owners),
         hot_experts=tuple(hot_experts),
-        secondary_ranks=tuple(secondary_ranks),
         optimizer=optimizer,
         training_request_hashes=training_hashes,
         heldout_request_hashes=heldout_hashes,

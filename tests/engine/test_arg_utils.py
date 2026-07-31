@@ -16,7 +16,6 @@ from vllm.config import (
     TieredMoEConfig,
     config,
 )
-from vllm.config.tiered_moe import validate_replica_routing_layout
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -228,10 +227,6 @@ def test_tiered_moe_cli_args():
             "--enable-tiered-moe",
             "--tiered-moe-backend",
             "uva",
-            "--tiered-moe-placement-profile",
-            "/tmp/placement.json",
-            "--tiered-moe-replica-assignment",
-            "secondary",
             "--tiered-moe-hbm-reserve-gb",
             "6",
             "--tiered-moe-host-reserve-gb",
@@ -246,8 +241,6 @@ def test_tiered_moe_cli_args():
 
     assert args.enable_tiered_moe
     assert args.tiered_moe_backend == "uva"
-    assert args.tiered_moe_placement_profile == "/tmp/placement.json"
-    assert args.tiered_moe_replica_assignment == "secondary"
     assert args.tiered_moe_hbm_reserve_gb == 6
     assert args.tiered_moe_host_reserve_gb == 9
     assert args.tiered_moe_plan_only
@@ -264,15 +257,6 @@ def test_tiered_moe_config_enforces_reserves_and_enablement():
         TieredMoEConfig(enabled=True, hbm_reserve_gb=4.99)
     with pytest.raises(ValueError, match="at least 8 GB host"):
         TieredMoEConfig(enabled=True, host_reserve_gb=7.99)
-    with pytest.raises(ValueError, match="requires enable_tiered_moe"):
-        TieredMoEConfig(replica_assignment="secondary")
-    with pytest.raises(ValueError, match="requires a placement profile"):
-        TieredMoEConfig(
-            enabled=True,
-            replica_assignment="secondary",
-            mla_cache_tier="hbm",
-            grace_machine_profile="/tmp/gh200.json",
-        )
 
     config = TieredMoEConfig(
         enabled=True,
@@ -290,30 +274,6 @@ def test_tiered_moe_config_enforces_reserves_and_enablement():
         grace_machine_profile="/tmp/gh200.json",
     )
     assert low_reserve_config.hbm_reserve_gb == 5
-
-
-@pytest.mark.parametrize(
-    ("override", "reason"),
-    [
-        ({"disable_custom_all_reduce": True}, "custom all-reduce is disabled"),
-        ({"data_parallel_size": 2}, "TP size 4 differs from EP size 8"),
-        ({"pipeline_parallel_size": 2}, "pipeline-sharded routing"),
-        ({"enable_expert_parallel": False}, "expert parallelism is disabled"),
-    ],
-)
-def test_replica_assignment_rejects_nonidentical_routing_layout(override, reason):
-    values = {
-        "tensor_parallel_size": 4,
-        "data_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "enable_expert_parallel": True,
-        "disable_custom_all_reduce": False,
-    }
-    values.update(override)
-    parallel = type("Parallel", (), values)()
-
-    with pytest.raises(ValueError, match=reason):
-        validate_replica_routing_layout("greedy", parallel)
 
 
 @pytest.mark.parametrize("mode", ["warn", "error"])

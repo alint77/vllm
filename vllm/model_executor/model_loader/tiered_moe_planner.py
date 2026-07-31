@@ -24,17 +24,6 @@ class LayerExpertPlacement:
     layer_id: int
     hot_expert_ids: tuple[int, ...]
     cold_expert_ids: tuple[int, ...]
-    replica_expert_ids: tuple[int, ...] = ()
-
-    @property
-    def primary_expert_ids(self) -> tuple[int, ...]:
-        """Return experts whose unique owner is this rank."""
-        return self.hot_expert_ids + self.cold_expert_ids
-
-    @property
-    def local_expert_ids(self) -> tuple[int, ...]:
-        """Return primary and secondary experts stored by this rank."""
-        return self.primary_expert_ids + self.replica_expert_ids
 
 
 @dataclass(frozen=True)
@@ -67,21 +56,14 @@ class RankTierPlan:
     @property
     def cold_expert_slots(self) -> int:
         """Number of layer-expert instances assigned to Grace memory."""
-        return sum(
-            len(layer.cold_expert_ids) + len(layer.replica_expert_ids)
-            for layer in self.layer_placements
-        )
-
-    @property
-    def replica_expert_slots(self) -> int:
-        """Number of secondary Grace-resident layer-expert instances."""
-        return sum(len(layer.replica_expert_ids) for layer in self.layer_placements)
+        return sum(len(layer.cold_expert_ids) for layer in self.layer_placements)
 
     @property
     def owned_expert_ids_by_layer(self) -> dict[int, tuple[int, ...]]:
         """Return the strict loader ownership map for routed layers."""
         return {
-            layer.layer_id: layer.local_expert_ids for layer in self.layer_placements
+            layer.layer_id: layer.hot_expert_ids + layer.cold_expert_ids
+            for layer in self.layer_placements
         }
 
     @property
@@ -109,7 +91,6 @@ class RankTierPlan:
             "expert_bytes": self.expert_bytes,
             "hot_expert_slots": self.hot_expert_slots,
             "cold_expert_slots": self.cold_expert_slots,
-            "replica_expert_slots": self.replica_expert_slots,
             "fixed_hbm_allocations": dict(self.fixed_hbm_allocations),
             "fixed_host_allocations": dict(self.fixed_host_allocations),
             "fixed_hbm_bytes": self.fixed_hbm_bytes,
@@ -130,7 +111,6 @@ class RankTierPlan:
                     "layer_id": layer.layer_id,
                     "hot_expert_ids": list(layer.hot_expert_ids),
                     "cold_expert_ids": list(layer.cold_expert_ids),
-                    "replica_expert_ids": list(layer.replica_expert_ids),
                 }
                 for layer in self.layer_placements
             ],
@@ -269,7 +249,6 @@ def plan_rank_expert_tiers(
     transient_hbm_bytes: int = 0,
     owned_expert_ids_by_layer: Mapping[int, tuple[int, ...]] | None = None,
     hot_expert_ids_by_layer: Mapping[int, tuple[int, ...]] | None = None,
-    replica_expert_ids_by_layer: Mapping[int, tuple[int, ...]] | None = None,
 ) -> RankTierPlan:
     """Place as many owned expert instances in HBM as exact capacity permits.
 
@@ -344,32 +323,12 @@ def plan_rank_expert_tiers(
                 raise ValueError("Static ownership map has an invalid expert ID")
 
     owned_expert_ids = next(iter(ownership_map.values()))
-    primary_slots = sum(len(expert_ids) for expert_ids in ownership_map.values())
-    replica_map: dict[int, tuple[int, ...]]
-    if replica_expert_ids_by_layer is None:
-        replica_map = {layer_id: () for layer_id in manifest.routed_layers}
-    else:
-        replica_map = {
-            layer_id: tuple(expert_ids)
-            for layer_id, expert_ids in replica_expert_ids_by_layer.items()
-        }
-        if set(replica_map) != set(manifest.routed_layers):
-            raise ValueError("Static replica map does not cover routed layers")
-        for layer_id, expert_ids in replica_map.items():
-            if len(set(expert_ids)) != len(expert_ids):
-                raise ValueError("Static replicas must be unique within a rank")
-            if set(expert_ids) & set(ownership_map[layer_id]):
-                raise ValueError("Static replicas cannot duplicate a local primary")
-            if any(
-                not 0 <= expert_id < manifest.num_experts for expert_id in expert_ids
-            ):
-                raise ValueError("Static replica map has an invalid expert ID")
-    replica_slots = sum(len(expert_ids) for expert_ids in replica_map.values())
-    hot_slots = min(primary_slots, available_hbm // manifest.runtime_expert_bytes)
+    total_slots = sum(len(expert_ids) for expert_ids in ownership_map.values())
+    hot_slots = min(total_slots, available_hbm // manifest.runtime_expert_bytes)
     if hot_expert_ids_by_layer is not None and envs.VLLM_TIERED_MOE_PROFILE_CAP:
         profile_slots = sum(len(ids) for ids in hot_expert_ids_by_layer.values())
         hot_slots = min(hot_slots, profile_slots)
-    cold_slots = primary_slots - hot_slots + replica_slots
+    cold_slots = total_slots - hot_slots
     hot_expert_bytes = hot_slots * manifest.runtime_expert_bytes
     cold_expert_bytes = cold_slots * manifest.runtime_expert_bytes
     if fixed_hbm_bytes + hot_expert_bytes + transient_hbm_bytes > hbm_capacity_bytes:
@@ -408,15 +367,6 @@ def plan_rank_expert_tiers(
             cold = tuple(expert_id for expert_id in owned if expert_id not in hot_set)
             placements.append(LayerExpertPlacement(layer_id, tuple(sorted(hot)), cold))
         layer_placements = tuple(placements)
-    layer_placements = tuple(
-        LayerExpertPlacement(
-            placement.layer_id,
-            placement.hot_expert_ids,
-            placement.cold_expert_ids,
-            tuple(sorted(replica_map[placement.layer_id])),
-        )
-        for placement in layer_placements
-    )
     return RankTierPlan(
         ep_rank=ep_rank,
         ep_size=ep_size,

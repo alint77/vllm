@@ -176,17 +176,16 @@ def allocate_layer_expert_storage(
         )
 
     cold = None
-    cold_expert_ids = placement.cold_expert_ids + placement.replica_expert_ids
-    if cold_expert_ids:
-        cold_bytes = len(cold_expert_ids) * expert_bytes
+    if placement.cold_expert_ids:
+        cold_bytes = len(placement.cold_expert_ids) * expert_bytes
         allocation = GraceAllocation.allocate_pinned(
             (cold_bytes,), torch.uint8, device_index, numa_node
         )
         cold = ExpertTierStorage(
-            expert_ids=cold_expert_ids,
+            expert_ids=placement.cold_expert_ids,
             buffer=allocation.cuda_alias,
             components=build_expert_component_views(
-                allocation.cuda_alias, len(cold_expert_ids), group_size
+                allocation.cuda_alias, len(placement.cold_expert_ids), group_size
             ),
             component_specs=component_specs,
             grace_allocation=allocation,
@@ -194,7 +193,7 @@ def allocate_layer_expert_storage(
 
     storage = LayerTieredExpertStorage(placement.layer_id, hot, cold)
     expected_bytes = (
-        len(placement.hot_expert_ids) + len(cold_expert_ids)
+        len(placement.hot_expert_ids) + len(placement.cold_expert_ids)
     ) * expert_bytes
     if storage.num_bytes != expected_bytes:
         raise AssertionError("Tiered layer allocation does not match its placement")

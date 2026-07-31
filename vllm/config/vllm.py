@@ -2258,8 +2258,6 @@ class VllmConfig:
         """Reject configurations outside the initial tiered-MoE contract."""
         if not self.tiered_moe_config.enabled:
             return self
-        from vllm.config.tiered_moe import validate_replica_routing_layout
-
         if self.model_config is None:
             raise ValueError("Tiered MoE requires a model configuration")
         if self.model_config.architectures != ["GlmMoeDsaForCausalLM"]:
@@ -2270,18 +2268,6 @@ class VllmConfig:
         if self.device_config.device_type != "cuda":
             raise ValueError("Tiered MoE requires CUDA")
         parallel = self.parallel_config
-        validate_replica_routing_layout(
-            self.tiered_moe_config.replica_assignment,
-            parallel,
-        )
-        if (
-            self.tiered_moe_config.replica_assignment == "greedy"
-            and envs.VLLM_TIERED_MOE_ROUTE_CHECK_INTERVAL > 0
-            and not self.model_config.enforce_eager
-        ):
-            raise ValueError(
-                "VLLM_TIERED_MOE_ROUTE_CHECK_INTERVAL requires --enforce-eager"
-            )
         if (
             parallel.tensor_parallel_size != 4
             or parallel.data_parallel_size != 1

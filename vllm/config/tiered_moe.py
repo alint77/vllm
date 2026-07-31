@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for tiered MoE execution on coherent CPU-GPU memory."""
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -10,37 +10,6 @@ from vllm.config.utils import config
 
 TieredMoEBackend = Literal["auto", "uva", "cpu"]
 MLACacheTier = Literal["auto", "hbm", "host_uva"]
-ReplicaAssignment = Literal["off", "secondary", "greedy"]
-
-
-def validate_replica_routing_layout(
-    replica_assignment: ReplicaAssignment,
-    parallel_config: Any,
-) -> None:
-    """Require a layout with bitwise-identical routes on every EP rank."""
-    if replica_assignment == "off":
-        return
-
-    ep_size = parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
-    reasons = []
-    if parallel_config.disable_custom_all_reduce:
-        reasons.append("custom all-reduce is disabled")
-    if parallel_config.tensor_parallel_size != ep_size:
-        reasons.append(
-            f"TP size {parallel_config.tensor_parallel_size} differs from "
-            f"EP size {ep_size}"
-        )
-    if parallel_config.data_parallel_size != 1:
-        reasons.append("data-parallel routing is configured")
-    if parallel_config.pipeline_parallel_size != 1:
-        reasons.append("pipeline-sharded routing is configured")
-    if not parallel_config.enable_expert_parallel:
-        reasons.append("expert parallelism is disabled")
-    if reasons:
-        raise ValueError(
-            "Tiered MoE replica assignment requires bitwise-identical "
-            f"cross-rank routing; {'; '.join(reasons)}"
-        )
 
 
 @config
@@ -55,9 +24,6 @@ class TieredMoEConfig:
 
     placement_profile: str | None = None
     """Optional static per-layer expert placement profile path."""
-
-    replica_assignment: ReplicaAssignment = "off"
-    """Replica assignment: primary-only, static secondary, or greedy decode."""
 
     routing_trace_output: str | None = None
     """Optional path for writing a sequence-level routing trace."""
@@ -85,12 +51,6 @@ class TieredMoEConfig:
         """Enforce mandatory reserves whenever the tiered path is requested."""
         if self.plan_only and not self.enabled:
             raise ValueError("tiered_moe_plan_only requires enable_tiered_moe")
-        if self.replica_assignment != "off" and not self.enabled:
-            raise ValueError("tiered_moe_replica_assignment requires enable_tiered_moe")
-        if self.replica_assignment != "off" and self.placement_profile is None:
-            raise ValueError(
-                "tiered_moe_replica_assignment requires a placement profile"
-            )
         if self.enabled and self.hbm_reserve_gb < 5.0:
             raise ValueError("Tiered MoE requires at least 5 GB HBM reserve")
         if self.enabled and self.host_reserve_gb < 8.0:

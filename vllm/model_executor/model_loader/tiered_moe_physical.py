@@ -70,7 +70,6 @@ class TieredMoERankLoadPlan:
     runtime_buffers: TieredMoERuntimeBuffers
     kv_cache: TieredKVCachePlan
     rank_plan: RankTierPlan
-    placement_profile: TieredMoEPlacementProfile | None = None
 
 
 _ACTIVE_RANK_LOAD_PLAN: ContextVar[TieredMoERankLoadPlan | None] = ContextVar(
@@ -144,33 +143,6 @@ def resolve_layer_expert_placement(
         if placement.layer_id == layer_id:
             return placement
     raise ValueError(f"Tiered MoE plan has no placement for layer {layer_id}")
-
-
-def attach_tiered_moe_layer_placement(
-    layer: Any,
-    plan: TieredMoERankLoadPlan,
-    placement: LayerExpertPlacement,
-) -> None:
-    """Attach one rank's physical and cross-rank replica maps to a layer."""
-    layer.tiered_moe_placement = placement
-    layer.tiered_moe_ep_rank = plan.rank_plan.ep_rank
-    profile = plan.placement_profile
-    if profile is None:
-        return
-    try:
-        layer_offset = profile.routed_layers.index(placement.layer_id)
-    except ValueError as error:
-        raise ValueError(
-            f"Placement profile has no routed layer {placement.layer_id}"
-        ) from error
-    layer.tiered_moe_primary_ranks = profile.owners[layer_offset]
-    layer.tiered_moe_secondary_ranks = profile.secondary_ranks[layer_offset]
-    layer.tiered_replica_route_check = layer_offset == 0
-    layer.tiered_replica_route_check_count = 0
-    hot_experts = set(profile.hot_experts[layer_offset])
-    layer.tiered_moe_primary_hot = tuple(
-        expert_id in hot_experts for expert_id in range(profile.num_experts)
-    )
 
 
 def plan_tiered_moe_scenario(
@@ -255,11 +227,6 @@ def plan_tiered_moe_scenario(
                 if placement_profile is not None
                 else None
             ),
-            replica_expert_ids_by_layer=(
-                placement_profile.replicas_for_rank(rank)
-                if placement_profile is not None
-                else None
-            ),
         )
         for rank in range(ep_size)
     )
@@ -333,5 +300,4 @@ def build_tiered_moe_rank_load_plan(
         runtime_buffers,
         scenario.kv_cache,
         scenario.rank_plans[ep_rank],
-        placement_profile,
     )

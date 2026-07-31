@@ -536,7 +536,6 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
 
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
         from vllm.model_executor.model_loader.tiered_moe_physical import (
-            attach_tiered_moe_layer_placement,
             get_tiered_moe_rank_load_plan,
             resolve_layer_expert_placement,
         )
@@ -544,11 +543,13 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         tiered_plan = get_tiered_moe_rank_load_plan()
         if tiered_plan is not None:
             placement = resolve_layer_expert_placement(tiered_plan, self.layer_name)
-            primary_experts = len(placement.primary_expert_ids)
-            if num_experts != primary_experts:
+            planned_experts = len(placement.hot_expert_ids) + len(
+                placement.cold_expert_ids
+            )
+            if num_experts != planned_experts:
                 raise ValueError(
-                    f"Tiered layer {placement.layer_id} plans {primary_experts} "
-                    f"primary experts but native construction requested {num_experts}"
+                    f"Tiered layer {placement.layer_id} plans {planned_experts} "
+                    f"experts but native construction requested {num_experts}"
                 )
             if (
                 self.wna16_moe_backend != WNA16MoEBackend.MARLIN
@@ -571,7 +572,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             )
             from vllm.utils.numa_utils import _get_numa_node
 
-            attach_tiered_moe_layer_placement(layer, tiered_plan, placement)
+            layer.tiered_moe_placement = placement
             device_index = torch.accelerator.current_device_index()
             parallel_config = get_current_vllm_config().parallel_config
             numa_node = _get_numa_node(parallel_config, device_index)
