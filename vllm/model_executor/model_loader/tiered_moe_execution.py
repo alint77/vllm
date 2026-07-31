@@ -103,11 +103,7 @@ def _attach_replica_tensors(
     """Materialise the profile's per-layer replica tables on the device."""
     from vllm.config import get_current_vllm_config
 
-    assignment = getattr(
-        getattr(get_current_vllm_config(), "tiered_moe", None),
-        "replica_assignment",
-        "off",
-    )
+    assignment = get_current_vllm_config().tiered_moe_config.replica_assignment
     method.tiered_replica_assignment = assignment
     if assignment == "off":
         return

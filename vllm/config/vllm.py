@@ -48,7 +48,7 @@ from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
 from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
-from .tiered_moe import TieredMoEConfig
+from .tiered_moe import TieredMoEConfig, validate_replica_routing_layout
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
 
@@ -2300,6 +2300,11 @@ class VllmConfig:
             raise ValueError("Tiered MoE requires NUMA binding")
         if not 1 <= self.scheduler_config.max_num_seqs <= 4:
             raise ValueError("Tiered MoE supports max_num_seqs 1 through 4")
+        # Replica assignment is only safe when every EP rank derives the same
+        # routes, so reject the layouts that cannot guarantee it.
+        validate_replica_routing_layout(
+            self.tiered_moe_config.replica_assignment, parallel
+        )
         if (
             self.scheduler_config.max_num_seqs > 1
             and parallel.decode_context_parallel_size == 1
