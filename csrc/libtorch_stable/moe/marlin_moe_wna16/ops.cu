@@ -45,6 +45,14 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
+// smem_mode values for marlin_mm / moe_wna16_marlin_gemm.
+constexpr int MARLIN_SMEM_LEGACY = -1;  // device shared memory / blocks_per_sm
+constexpr int MARLIN_SMEM_TIGHT = -2;   // only what the kernel indexes
+
+inline int round_up_to(int value, int multiple) {
+  return ((value + multiple - 1) / multiple) * multiple;
+}
+
 // For a given "a" of size [M,K] performs a permutation of the K columns based
 // on the given "perm" indices.
 template <int moe_block_size>
@@ -353,7 +361,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               bool use_fp32_reduce, bool is_zp_float, int smem_mode,
+               int grid_blocks) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -526,11 +535,27 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         ", thread_k_blocks = ", thread_k_blocks, ", num_bits = ", num_bits);
   }
 
+  // By default the launch requests `max_shared_mem`, i.e. the device's shared
+  // memory divided by blocks_per_sm, rather than the `sh_cache_size` the kernel
+  // actually indexes. That pins occupancy at exactly blocks_per_sm, but it also
+  // makes every wave claim ~100% of each SM's shared memory, so no other kernel
+  // can become co-resident. Callers that run two Marlin launches concurrently
+  // (e.g. a tiered MoE with weights in different memories) pass
+  // smem_mode = MARLIN_SMEM_TIGHT to request only what is used, plus an
+  // explicit grid, and recover the overlap.
+  int launch_smem = max_shared_mem;
+  if (smem_mode == MARLIN_SMEM_TIGHT) {
+    launch_smem = round_up_to(sh_cache_size, 128);
+  }
+  STD_TORCH_CHECK(launch_smem >= sh_cache_size, "launch_smem = ", launch_smem,
+                  " is smaller than the kernel's shared memory requirement ",
+                  sh_cache_size);
+  int launch_blocks = grid_blocks > 0 ? grid_blocks : blocks;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       max_shared_mem);
+                       launch_smem);
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
-  kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
+  kernel<<<launch_blocks, num_threads, launch_smem, stream>>>(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
@@ -557,7 +582,7 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     bool mul_topk_weights, vllm::ScalarTypeId const& b_type_id, int64_t size_m,
     int64_t size_n, int64_t size_k, bool is_k_full, bool use_atomic_add,
     bool use_fp32_reduce, bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm, int64_t smem_mode, int64_t grid_blocks) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.scalar_type();
@@ -888,7 +913,7 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
       a_type, b_type, c_type, s_type, has_bias, has_act_order, is_k_full,
       has_zp, num_groups, group_size, dev, get_current_cuda_stream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float);
+      is_zp_float, smem_mode, grid_blocks);
 
   return c;
 }

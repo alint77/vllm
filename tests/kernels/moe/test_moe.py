@@ -8,6 +8,7 @@ Run `pytest tests/kernels/test_moe.py`.
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ import torch
 from torch.nn import Parameter
 from torch.nn import functional as F
 
+import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe  # noqa
 from tests.kernels.moe.utils import (
     fused_moe,
@@ -33,6 +35,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    MarlinLaunchPolicy,
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
@@ -1007,6 +1010,126 @@ def test_fused_marlin_moe(
     )
 
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+@pytest.mark.parametrize("tier,blocks_per_sm", [("hot", 2), ("cold", 1)])
+def test_tiered_moe_launch_policy_reaches_the_experts(tier, blocks_per_sm):
+    """The policy has to land on the experts object the gemm actually reads.
+
+    `kernel.impl` is the modular impl; the Marlin experts holding `launch_policy`
+    are one level deeper at `kernel.impl.fused_experts`. Attaching it to the
+    wrong object leaves the two tiers serialized while every kernel-level test
+    still passes, so this asserts the wiring rather than the maths.
+    """
+    from unittest.mock import create_autospec
+
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        MarlinExpertsBase,
+    )
+    from vllm.model_executor.model_loader.tiered_moe_execution import (
+        _apply_tier_launch_policy,
+    )
+
+    experts = create_autospec(MarlinExpertsBase, instance=True)
+    kernel = SimpleNamespace(impl=SimpleNamespace(fused_experts=experts))
+    device = torch.device("cuda:0")
+
+    _apply_tier_launch_policy(kernel, tier, device, max_tokens=4)
+
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    assert experts.launch_policy.smem_mode == ops.MARLIN_SMEM_TIGHT
+    assert experts.launch_policy.grid_blocks == sms * blocks_per_sm
+    assert experts.launch_policy.max_tokens == 4
+
+    # a non-Marlin backend must fail closed, not silently skip the policy
+    with pytest.raises(TypeError):
+        _apply_tier_launch_policy(
+            SimpleNamespace(impl=SimpleNamespace(fused_experts=object())),
+            tier,
+            device,
+            max_tokens=4,
+        )
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+@pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("m", [4, 16])
+def test_fused_marlin_moe_launch_policy(m):
+    """A tight shared-memory request must not change the result.
+
+    Marlin's default launch asks for the device's shared memory divided by
+    blocks_per_sm, so one wave owns every SM and two concurrent Marlin launches
+    (the tiered MoE's HBM and host tiers) can never be co-resident. Requesting
+    only what the kernel indexes fixes that; at the same grid it must be
+    bit-exact, and at a different grid it may only differ by reduction order
+    because the DP/split-K decomposition changes.
+    """
+    set_random_seed(0)
+
+    e, topk = 16, 4
+    n, k = 1024, 1024
+    quant_type = scalar_types.uint4b8
+
+    a = torch.randn((m, k), device="cuda", dtype=torch.half) / 10
+    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=torch.half) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=torch.half) / 10
+    w1_data = MarlinMoEWeightData.make(
+        w=w1, quant_type=quant_type, group_size=128, act_order=False
+    )
+    w2_data = MarlinMoEWeightData.make(
+        w=w2, quant_type=quant_type, group_size=128, act_order=False
+    )
+    score = torch.randn((m, e), device="cuda", dtype=torch.half)
+    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+
+    def run(policy):
+        return fused_marlin_moe(
+            a,
+            w1_data.qweight,
+            w2_data.qweight,
+            None,
+            None,
+            w1_data.scales,
+            w2_data.scales,
+            topk_weights,
+            topk_ids,
+            global_num_experts=e,
+            expert_map=None,
+            g_idx1=w1_data.g_idx,
+            g_idx2=w2_data.g_idx,
+            sort_indices1=w1_data.sort_indices,
+            sort_indices2=w2_data.sort_indices,
+            w1_zeros=w1_data.zeros,
+            w2_zeros=w2_data.zeros,
+            quant_type_id=quant_type.id,
+            is_k_full=True,
+            launch_policy=policy,
+        )
+
+    sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    reference = run(None)
+    torch.testing.assert_close(run(None), reference, atol=0, rtol=0)
+
+    # The grids the tiered MoE gives its cold and hot tiers. A grid change moves
+    # work between the data-parallel and split-K halves of Marlin's scheduler,
+    # so the fp32 accumulation order changes; each grid must still be exactly
+    # reproducible and must agree with the default launch numerically.
+    for blocks_per_sm in (1, 2, 3):
+        policy = MarlinLaunchPolicy(
+            smem_mode=ops.MARLIN_SMEM_TIGHT,
+            grid_blocks=sms * blocks_per_sm,
+            max_tokens=m,
+        )
+        out = run(policy)
+        torch.testing.assert_close(run(policy), out, atol=0, rtol=0)
+        torch.testing.assert_close(out, reference, atol=2e-2, rtol=0)
+
+    # above max_tokens the policy must be ignored, so the default launch runs
+    ignored = MarlinLaunchPolicy(
+        smem_mode=ops.MARLIN_SMEM_TIGHT, grid_blocks=sms, max_tokens=m - 1
+    )
+    torch.testing.assert_close(run(ignored), reference, atol=0, rtol=0)
 
 
 @pytest.mark.flaky(reruns=2)

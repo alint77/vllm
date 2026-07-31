@@ -227,6 +227,10 @@ def test_tiered_moe_cli_args():
             "--enable-tiered-moe",
             "--tiered-moe-backend",
             "uva",
+            "--tiered-moe-placement-profile",
+            "/tmp/placement.json",
+            "--tiered-moe-replica-assignment",
+            "secondary",
             "--tiered-moe-hbm-reserve-gb",
             "6",
             "--tiered-moe-host-reserve-gb",
@@ -241,6 +245,8 @@ def test_tiered_moe_cli_args():
 
     assert args.enable_tiered_moe
     assert args.tiered_moe_backend == "uva"
+    assert args.tiered_moe_placement_profile == "/tmp/placement.json"
+    assert args.tiered_moe_replica_assignment == "secondary"
     assert args.tiered_moe_hbm_reserve_gb == 6
     assert args.tiered_moe_host_reserve_gb == 9
     assert args.tiered_moe_plan_only
@@ -257,6 +263,15 @@ def test_tiered_moe_config_enforces_reserves_and_enablement():
         TieredMoEConfig(enabled=True, hbm_reserve_gb=4.99)
     with pytest.raises(ValueError, match="at least 8 GB host"):
         TieredMoEConfig(enabled=True, host_reserve_gb=7.99)
+    with pytest.raises(ValueError, match="requires enable_tiered_moe"):
+        TieredMoEConfig(replica_assignment="secondary")
+    with pytest.raises(ValueError, match="requires a placement profile"):
+        TieredMoEConfig(
+            enabled=True,
+            replica_assignment="secondary",
+            mla_cache_tier="hbm",
+            grace_machine_profile="/tmp/gh200.json",
+        )
 
     config = TieredMoEConfig(
         enabled=True,

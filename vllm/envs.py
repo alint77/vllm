@@ -270,6 +270,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
     VLLM_TIERED_MOE_PROFILE_CAP: bool = False
+    VLLM_TIERED_MOE_TIGHT_SMEM: bool = True
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
@@ -1914,6 +1915,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TIERED_MOE_PROFILE_CAP": lambda: bool(
         int(os.getenv("VLLM_TIERED_MOE_PROFILE_CAP", "0"))
+    ),
+    # Launch the tiered MoE's hot and cold Marlin kernels with only the shared
+    # memory they use, so both tiers can be resident on an SM and overlap.
+    # Set to 0 to restore the upstream launch (one tier at a time).
+    "VLLM_TIERED_MOE_TIGHT_SMEM": lambda: bool(
+        int(os.getenv("VLLM_TIERED_MOE_TIGHT_SMEM", "1"))
     ),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),

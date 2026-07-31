@@ -10,6 +10,7 @@ from vllm.config.utils import config
 
 TieredMoEBackend = Literal["auto", "uva", "cpu"]
 MLACacheTier = Literal["auto", "hbm", "host_uva"]
+ReplicaAssignment = Literal["off", "secondary", "greedy"]
 
 
 @config
@@ -24,6 +25,9 @@ class TieredMoEConfig:
 
     placement_profile: str | None = None
     """Optional static per-layer expert placement profile path."""
+
+    replica_assignment: ReplicaAssignment = "off"
+    """Replica assignment: primary-only, static secondary, or greedy decode."""
 
     routing_trace_output: str | None = None
     """Optional path for writing a sequence-level routing trace."""
@@ -51,6 +55,12 @@ class TieredMoEConfig:
         """Enforce mandatory reserves whenever the tiered path is requested."""
         if self.plan_only and not self.enabled:
             raise ValueError("tiered_moe_plan_only requires enable_tiered_moe")
+        if self.replica_assignment != "off" and not self.enabled:
+            raise ValueError("tiered_moe_replica_assignment requires enable_tiered_moe")
+        if self.replica_assignment != "off" and self.placement_profile is None:
+            raise ValueError(
+                "tiered_moe_replica_assignment requires a placement profile"
+            )
         if self.enabled and self.hbm_reserve_gb < 5.0:
             raise ValueError("Tiered MoE requires at least 5 GB HBM reserve")
         if self.enabled and self.host_reserve_gb < 8.0:

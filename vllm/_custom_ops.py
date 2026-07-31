@@ -2396,6 +2396,15 @@ def grouped_topk(
     )
 
 
+# Dynamic shared memory requested per CTA by the Marlin MoE launch.
+# LEGACY asks for the device's shared memory divided by blocks_per_sm, which
+# pins occupancy but leaves no room for any other kernel on the SM. TIGHT asks
+# only for what the kernel indexes, so two Marlin launches (e.g. the tiered
+# MoE's HBM and host-memory tiers) can be co-resident and actually overlap.
+MARLIN_SMEM_LEGACY = -1
+MARLIN_SMEM_TIGHT = -2
+
+
 def moe_wna16_marlin_gemm(
     input: torch.Tensor,
     output: torch.Tensor | None,
@@ -2426,6 +2435,8 @@ def moe_wna16_marlin_gemm(
     thread_k: int = -1,
     thread_n: int = -1,
     blocks_per_sm: int = -1,
+    smem_mode: int = MARLIN_SMEM_LEGACY,
+    grid_blocks: int = -1,
 ) -> torch.Tensor:
     return torch.ops._moe_C.moe_wna16_marlin_gemm(
         input,
@@ -2457,6 +2468,8 @@ def moe_wna16_marlin_gemm(
         thread_k,
         thread_n,
         blocks_per_sm,
+        smem_mode,
+        grid_blocks,
     )
 
 
@@ -2490,6 +2503,11 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "moe_wna16_marlin_
         use_atomic_add: bool,
         use_fp32_reduce: bool,
         is_zp_float: bool,
+        thread_k: int = -1,
+        thread_n: int = -1,
+        blocks_per_sm: int = -1,
+        smem_mode: int = MARLIN_SMEM_LEGACY,
+        grid_blocks: int = -1,
     ):
         return torch.empty(
             (size_m * top_k, size_n), dtype=input.dtype, device=input.device

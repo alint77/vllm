@@ -86,7 +86,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "int size_m, int size_n, int size_k,"
       "bool is_full_k, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float,"
-      "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
+      "int thread_k, int thread_n, int blocks_per_sm,"
+      "int smem_mode, int grid_blocks) -> Tensor");
 
   m.def(
       "moe_permute(Tensor input, Tensor topk_ids,"

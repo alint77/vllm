@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -54,6 +55,29 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
 
+@dataclass(frozen=True)
+class MarlinLaunchPolicy:
+    """How to shape a Marlin MoE launch on the SM.
+
+    The default launch requests the device's shared memory divided by
+    `blocks_per_sm`, so one wave claims ~100% of every SM's shared memory and no
+    second Marlin kernel can be co-resident. A tiered MoE that runs two tiers on
+    two streams therefore serializes. Requesting only what the kernel indexes
+    (`smem_mode=MARLIN_SMEM_TIGHT`) and giving each tier an explicit grid lets
+    them share the SMs and overlap.
+
+    `grid_blocks` is absolute (SM count x CTAs per SM), so it must be chosen for
+    the device the model is running on.
+    """
+
+    smem_mode: int = ops.MARLIN_SMEM_LEGACY
+    grid_blocks: int = -1
+    # Only applied at or below this token count. The two tiers only run
+    # concurrently for small decode batches; above that they run one after the
+    # other, where the default heuristic's grid is the right one.
+    max_tokens: int = 0
+
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -93,9 +117,13 @@ def _fused_marlin_moe(
     clamp_limit: float | None = None,
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
+    launch_policy: MarlinLaunchPolicy | None = None,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
+    policy = MarlinLaunchPolicy()
+    if launch_policy is not None and launch_policy.max_tokens >= M:
+        policy = launch_policy
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
     if workspace is None:
@@ -159,6 +187,8 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        smem_mode=policy.smem_mode,
+        grid_blocks=policy.grid_blocks,
     )
     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
@@ -215,6 +245,8 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        smem_mode=policy.smem_mode,
+        grid_blocks=policy.grid_blocks,
     )
 
     return output
@@ -256,6 +288,7 @@ def fused_marlin_moe(
     clamp_limit: float | None = None,
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
+    launch_policy: MarlinLaunchPolicy | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -338,6 +371,7 @@ def fused_marlin_moe(
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
+        launch_policy=launch_policy,
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -574,6 +608,9 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         w2_g_idx_sort_indices: torch.Tensor | None = None,
         is_k_full: bool = True,
     ):
+        # Set by the tiered MoE builder so each tier can be launched with a
+        # shared-memory footprint that lets the two tiers be co-resident.
+        self.launch_policy: MarlinLaunchPolicy | None = None
         # TODO (varun) : Enable activation quantization
         assert (
             quant_config.use_mxfp4_w4a16
@@ -773,6 +810,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         ctx = self._lora_context
         if ctx is None:
             fused_marlin_moe(
+                launch_policy=self.launch_policy,
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
@@ -898,6 +936,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             self.moe_sum(moe_out, out, topk_ids, expert_map)
 
         return fused_marlin_moe(
+            launch_policy=self.launch_policy,
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
