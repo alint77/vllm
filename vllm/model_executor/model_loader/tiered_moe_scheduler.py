@@ -561,6 +561,60 @@ def _launch_assign_align(
     return out
 
 
+@triton.jit
+def _route_fingerprint_kernel(
+    topk_ids_ptr,
+    accumulator_ptr,
+    num_routes,
+    ROUTE_BLOCK: tl.constexpr,
+):
+    """Fold one layer's routes into a per-step order-independent fingerprint.
+
+    The exactly-once invariant holds only while every rank sees bitwise
+    identical routes. `validate_replica_routing_layout` rejects the layouts
+    that are known to break it, but a fingerprint catches the rest, including
+    a custom all-reduce that silently changes accumulation order.
+
+    Position-weighted so a permutation is detected, summed so no host sync or
+    device-side ordering is needed, and integer so it is exact rather than
+    exact-to-fp32.
+    """
+    routes = tl.arange(0, ROUTE_BLOCK)
+    mask = routes < num_routes
+    routed = tl.load(topk_ids_ptr + routes, mask=mask, other=0).to(tl.int64)
+    weighted = routed * (routes.to(tl.int64) + 1)
+    tl.atomic_add(accumulator_ptr, tl.sum(tl.where(mask, routed, 0), 0))
+    tl.atomic_add(accumulator_ptr + 1, tl.sum(tl.where(mask, weighted, 0), 0))
+
+
+def accumulate_route_fingerprint(
+    topk_ids: torch.Tensor, accumulator: torch.Tensor
+) -> None:
+    """Fold this layer's routes into the step accumulator, in place."""
+    flat = topk_ids.reshape(-1)
+    _route_fingerprint_kernel[(1,)](
+        flat,
+        accumulator,
+        flat.numel(),
+        ROUTE_BLOCK=triton.next_power_of_2(max(flat.numel(), 8)),
+        num_warps=4,
+    )
+
+
+def _accumulate_route_fingerprint_fake(
+    topk_ids: torch.Tensor, accumulator: torch.Tensor
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="tiered_moe_route_fingerprint",
+    op_func=accumulate_route_fingerprint,
+    mutates_args=["accumulator"],
+    fake_impl=_accumulate_route_fingerprint_fake,
+)
+
+
 def allocate_fused_routing(
     num_routes: int,
     num_experts: int,

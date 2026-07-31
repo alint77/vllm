@@ -196,6 +196,13 @@ def prepare_replica_routing(
     if len(method.tiered_moe_kernels) != 2:
         return False
 
+    if envs.VLLM_TIERED_MOE_ROUTE_CHECK and not hasattr(
+        layer, "tiered_replica_route_fingerprint"
+    ):
+        layer.tiered_replica_route_fingerprint = torch.zeros(
+            2, dtype=torch.int64, device=topk_ids.device
+        )
+
     routing = getattr(layer, "tiered_replica_routing", None)
     if routing is None:
         routing = allocate_fused_routing(
@@ -206,6 +213,11 @@ def prepare_replica_routing(
             topk_ids.device,
         )
         layer.tiered_replica_routing = routing
+
+    if envs.VLLM_TIERED_MOE_ROUTE_CHECK:
+        torch.ops.vllm.tiered_moe_route_fingerprint(
+            topk_ids, layer.tiered_replica_route_fingerprint
+        )
 
     torch.ops.vllm.tiered_moe_assign_align(
         topk_ids,

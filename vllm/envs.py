@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_USE_NCCL_SYMM_MEM: bool = False
     VLLM_TIERED_MOE_PROFILE_CAP: bool = False
     VLLM_TIERED_MOE_TIGHT_SMEM: bool = True
+    VLLM_TIERED_MOE_ROUTE_CHECK: bool = False
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
@@ -1919,6 +1920,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Launch the tiered MoE's hot and cold Marlin kernels with only the shared
     # memory they use, so both tiers can be resident on an SM and overlap.
     # Set to 0 to restore the upstream launch (one tier at a time).
+    # Fold every routed layer's routes into a per-step fingerprint that the
+    # worker all-reduces and compares. Replica assignment is only safe while
+    # every EP rank sees bitwise identical routes; unlike a host-side check
+    # this stays inside CUDA graph capture.
+    "VLLM_TIERED_MOE_ROUTE_CHECK": lambda: bool(
+        int(os.getenv("VLLM_TIERED_MOE_ROUTE_CHECK", "0"))
+    ),
     "VLLM_TIERED_MOE_TIGHT_SMEM": lambda: bool(
         int(os.getenv("VLLM_TIERED_MOE_TIGHT_SMEM", "1"))
     ),
