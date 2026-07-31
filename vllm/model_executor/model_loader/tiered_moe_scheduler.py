@@ -13,6 +13,37 @@ _HBM_COST = 1280
 _GRACE_COST = 3467
 
 
+def _replica_route_hash(topk_ids: torch.Tensor) -> torch.Tensor:
+    routes = topk_ids.reshape(-1).to(torch.int64) + 1
+    positions = torch.arange(
+        1,
+        routes.numel() + 1,
+        dtype=torch.int64,
+        device=routes.device,
+    )
+    modulus = 1_000_003
+    return torch.stack(
+        (
+            routes.new_tensor(routes.numel() % modulus),
+            routes.sum() % modulus,
+            (routes * (positions % 251)).sum() % modulus,
+            (routes * (positions % 509)).sum() % modulus,
+        )
+    ).to(torch.float32)
+
+
+def validate_replicated_routes(topk_ids: torch.Tensor, ep_size: int) -> None:
+    """Raise when replica scheduling inputs differ across EP ranks."""
+    from vllm.distributed.parallel_state import get_ep_group
+
+    local_hash = _replica_route_hash(topk_ids)
+    reduced_hash = get_ep_group().all_reduce(local_hash)
+    if not torch.equal(reduced_hash, local_hash * ep_size):
+        raise RuntimeError(
+            "Tiered MoE replica assignment detected divergent cross-rank routes"
+        )
+
+
 def greedy_replica_assignment(
     route_counts: Sequence[int],
     primary_ranks: Sequence[int],
@@ -100,7 +131,7 @@ def _assign_replicated_experts_kernel(
     hot_output_map_ptr,
     cold_output_map_ptr,
     selected_ranks_ptr,
-    NUM_ROUTES: tl.constexpr,
+    NUM_ROUTES,
     NUM_EXPERTS: tl.constexpr,
     EP_SIZE: tl.constexpr,
     EP_RANK: tl.constexpr,
@@ -202,6 +233,8 @@ def _assign_replicated_experts_kernel(
     score = tl.where(flexible, score, -1)
     ordered_scores = tl.sort(score, descending=True)
     ordered_experts = NUM_EXPERTS - 1 - (ordered_scores % NUM_EXPERTS)
+    # Triton cannot dynamically index register vectors, so reuse the declared
+    # output as CTA-local ordering scratch until the final assignment is ready.
     tl.store(
         selected_ranks_ptr + experts,
         ordered_experts,

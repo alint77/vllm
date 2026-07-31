@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for tiered MoE execution on coherent CPU-GPU memory."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -11,6 +11,36 @@ from vllm.config.utils import config
 TieredMoEBackend = Literal["auto", "uva", "cpu"]
 MLACacheTier = Literal["auto", "hbm", "host_uva"]
 ReplicaAssignment = Literal["off", "secondary", "greedy"]
+
+
+def validate_replica_routing_layout(
+    replica_assignment: ReplicaAssignment,
+    parallel_config: Any,
+) -> None:
+    """Require a layout with bitwise-identical routes on every EP rank."""
+    if replica_assignment == "off":
+        return
+
+    ep_size = parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
+    reasons = []
+    if parallel_config.disable_custom_all_reduce:
+        reasons.append("custom all-reduce is disabled")
+    if parallel_config.tensor_parallel_size != ep_size:
+        reasons.append(
+            f"TP size {parallel_config.tensor_parallel_size} differs from "
+            f"EP size {ep_size}"
+        )
+    if parallel_config.data_parallel_size != 1:
+        reasons.append("data-parallel routing is configured")
+    if parallel_config.pipeline_parallel_size != 1:
+        reasons.append("pipeline-sharded routing is configured")
+    if not parallel_config.enable_expert_parallel:
+        reasons.append("expert parallelism is disabled")
+    if reasons:
+        raise ValueError(
+            "Tiered MoE replica assignment requires bitwise-identical "
+            f"cross-rank routing; {'; '.join(reasons)}"
+        )
 
 
 @config

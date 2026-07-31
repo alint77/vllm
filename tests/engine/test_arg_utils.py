@@ -16,6 +16,7 @@ from vllm.config import (
     TieredMoEConfig,
     config,
 )
+from vllm.config.tiered_moe import validate_replica_routing_layout
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -289,6 +290,30 @@ def test_tiered_moe_config_enforces_reserves_and_enablement():
         grace_machine_profile="/tmp/gh200.json",
     )
     assert low_reserve_config.hbm_reserve_gb == 5
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"disable_custom_all_reduce": True}, "custom all-reduce is disabled"),
+        ({"data_parallel_size": 2}, "TP size 4 differs from EP size 8"),
+        ({"pipeline_parallel_size": 2}, "pipeline-sharded routing"),
+        ({"enable_expert_parallel": False}, "expert parallelism is disabled"),
+    ],
+)
+def test_replica_assignment_rejects_nonidentical_routing_layout(override, reason):
+    values = {
+        "tensor_parallel_size": 4,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": True,
+        "disable_custom_all_reduce": False,
+    }
+    values.update(override)
+    parallel = type("Parallel", (), values)()
+
+    with pytest.raises(ValueError, match=reason):
+        validate_replica_routing_layout("greedy", parallel)
 
 
 @pytest.mark.parametrize("mode", ["warn", "error"])

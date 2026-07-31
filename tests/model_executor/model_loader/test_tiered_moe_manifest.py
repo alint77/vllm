@@ -66,8 +66,10 @@ from vllm.model_executor.model_loader.tiered_moe_runtime import (
     plan_tiered_glm_runtime_buffers,
 )
 from vllm.model_executor.model_loader.tiered_moe_scheduler import (
+    _replica_route_hash,
     assign_replicated_experts,
     greedy_replica_assignment,
+    validate_replicated_routes,
 )
 from vllm.model_executor.model_loader.tiered_moe_storage import (
     GLM_MARLIN_COMPONENTS,
@@ -612,6 +614,31 @@ def test_greedy_replica_assignment_balances_predicted_rank_span():
     )
 
     assert selected == (0, 0, -1, 1)
+
+
+def test_replica_route_check_rejects_divergent_rank_routes(monkeypatch):
+    local_routes = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    other_routes = torch.tensor([[0, 1, 2, 0]], dtype=torch.int32)
+    reduced_hash = _replica_route_hash(local_routes) + _replica_route_hash(other_routes)
+    group = SimpleNamespace(all_reduce=lambda _: reduced_hash)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_ep_group",
+        lambda: group,
+    )
+
+    with pytest.raises(RuntimeError, match="divergent cross-rank routes"):
+        validate_replicated_routes(local_routes, ep_size=2)
+
+
+def test_replica_route_check_accepts_identical_rank_routes(monkeypatch):
+    routes = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    group = SimpleNamespace(all_reduce=lambda value: value * 2)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_ep_group",
+        lambda: group,
+    )
+
+    validate_replicated_routes(routes, ep_size=2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

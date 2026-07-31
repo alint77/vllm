@@ -165,6 +165,8 @@ def attach_tiered_moe_layer_placement(
         ) from error
     layer.tiered_moe_primary_ranks = profile.owners[layer_offset]
     layer.tiered_moe_secondary_ranks = profile.secondary_ranks[layer_offset]
+    layer.tiered_replica_route_check = layer_offset == 0
+    layer.tiered_replica_route_check_count = 0
     hot_experts = set(profile.hot_experts[layer_offset])
     layer.tiered_moe_primary_hot = tuple(
         expert_id in hot_experts for expert_id in range(profile.num_experts)

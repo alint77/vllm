@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.tiered_moe_planner import (
 )
 from vllm.model_executor.model_loader.tiered_moe_scheduler import (
     assign_replicated_experts,
+    validate_replicated_routes,
 )
 
 
@@ -298,6 +299,13 @@ def apply_tiered_moe(
 ) -> torch.Tensor:
     """Execute the hot and cold expert tiers through their shared runtime."""
     if getattr(method, "tiered_replica_assignment", "off") == "greedy":
+        check_interval = envs.VLLM_TIERED_MOE_ROUTE_CHECK_INTERVAL
+        if check_interval < 0:
+            raise ValueError("VLLM_TIERED_MOE_ROUTE_CHECK_INTERVAL cannot be negative")
+        if check_interval and getattr(layer, "tiered_replica_route_check", False):
+            layer.tiered_replica_route_check_count += 1
+            if layer.tiered_replica_route_check_count % check_interval == 0:
+                validate_replicated_routes(topk_ids, method.tiered_moe_ep_size)
         assign_replicated_experts(
             topk_ids,
             layer.tiered_replica_primary_rank_map,
