@@ -191,6 +191,7 @@ def plan_tiered_moe_scenario(
     expert_placement: str,
     num_mtp_layers: int = 0,
     placement_profile: TieredMoEPlacementProfile | None = None,
+    replica_assignment: str = "off",
     dcp_world_size: int = 1,
     max_num_seqs: int = 1,
 ) -> TieredMoEScenarioPlan:
@@ -253,9 +254,13 @@ def plan_tiered_moe_scenario(
                 if placement_profile is not None
                 else None
             ),
+            # Only materialise secondary copies when assignment can use them.
+            # A profile carrying secondary ranks otherwise costs Grace capacity
+            # and load time for copies no route will ever reach, and makes the
+            # "off" arm of an A/B something other than the shipping baseline.
             replica_expert_ids_by_layer=(
                 placement_profile.replicas_for_rank(rank)
-                if placement_profile is not None
+                if placement_profile is not None and replica_assignment != "off"
                 else None
             ),
         )
@@ -319,6 +324,7 @@ def build_tiered_moe_rank_load_plan(
         expert_placement=parallel.expert_placement_strategy,
         num_mtp_layers=num_mtp_layers,
         placement_profile=placement_profile,
+        replica_assignment=tiered.replica_assignment,
         dcp_world_size=parallel.decode_context_parallel_size,
         max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
     )

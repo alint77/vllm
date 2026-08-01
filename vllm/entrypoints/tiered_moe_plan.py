@@ -175,6 +175,7 @@ def build_tiered_moe_plan(
             expert_placement=expert_placement,
             num_mtp_layers=num_mtp_layers,
             placement_profile=placement_profile,
+            replica_assignment=vllm_config.tiered_moe_config.replica_assignment,
             dcp_world_size=dcp_world_size,
             max_num_seqs=max_num_seqs,
         )
